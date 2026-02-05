@@ -135,6 +135,8 @@ suppress_gosnowflake_android_warning() {
     return 0
   fi
 
+  chmod -R u+w "$mod_dir" 2>/dev/null || true
+
   if grep -q 'runtime.GOOS == "android"' "$file"; then
     return 0
   fi
