@@ -42,6 +42,9 @@ WORK_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
 
+MODCACHE_DIR="$WORK_DIR/gomodcache"
+export GOMODCACHE="$MODCACHE_DIR"
+
 SRC_DIR="$WORK_DIR/expanso"
 
 clone_repo() {
@@ -109,6 +112,51 @@ if [[ -d "$PATCH_DIR" ]]; then
     fi
   done
 fi
+
+suppress_gosnowflake_android_warning() {
+  local mod_dir
+  local file
+  local tmp
+
+  if ! go mod download github.com/snowflakedb/gosnowflake >/dev/null 2>&1; then
+    return 0
+  fi
+
+  mod_dir="$(go list -m -f '{{.Dir}}' github.com/snowflakedb/gosnowflake 2>/dev/null || true)"
+  if [[ -z "$mod_dir" ]]; then
+    return 0
+  fi
+
+  file="$mod_dir/secure_storage_manager.go"
+  if [[ ! -f "$file" ]]; then
+    return 0
+  fi
+
+  if grep -q 'runtime.GOOS == "android"' "$file"; then
+    return 0
+  fi
+
+  if ! grep -q 'does not support credentials cache' "$file"; then
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  awk '
+    /logger\.Warnf\("OS %v does not support credentials cache", runtime\.GOOS\)/ {
+      print "\t\tif runtime.GOOS == \"android\" {"
+      print "\t\t\tlogger.Debugf(\"OS %v does not support credentials cache\", runtime.GOOS)"
+      print "\t\t} else {"
+      print "\t\t\tlogger.Warnf(\"OS %v does not support credentials cache\", runtime.GOOS)"
+      print "\t\t}"
+      next
+    }
+    { print }
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+  echo "Patched gosnowflake to silence Android credentials cache warning."
+}
+
+suppress_gosnowflake_android_warning
 
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
