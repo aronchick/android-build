@@ -44,20 +44,34 @@ trap cleanup EXIT
 
 SRC_DIR="$WORK_DIR/expanso"
 
+clone_repo() {
+  local url="$1"
+  local ref="$2"
+  local dest="$3"
+  local depth_args=(--depth 1 --filter=blob:none)
+
+  if [[ -n "$ref" ]]; then
+    depth_args+=(--branch "$ref")
+  fi
+
+  if ! git clone "${depth_args[@]}" "$url" "$dest" >/dev/null 2>&1; then
+    git clone "$url" "$dest" >/dev/null 2>&1
+  fi
+}
+
 if [[ -d "$REPO_URL/.git" ]]; then
-  git clone "$REPO_URL" "$SRC_DIR" >/dev/null 2>&1
+  clone_repo "$REPO_URL" "$REF" "$SRC_DIR"
 else
   if [[ "$REPO_URL" == https://github.com/* ]] && [[ -n "${GITHUB_TOKEN:-${GH_TOKEN:-}}" ]]; then
     token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
     auth_url="${REPO_URL/https:\/\/github.com\//https:\/\/${token}:x-oauth-basic@github.com/}"
-    git clone "$auth_url" "$SRC_DIR" >/dev/null 2>&1
+    clone_repo "$auth_url" "$REF" "$SRC_DIR"
   else
-    git clone "$REPO_URL" "$SRC_DIR" >/dev/null 2>&1
+    clone_repo "$REPO_URL" "$REF" "$SRC_DIR"
   fi
 fi
 cd "$SRC_DIR"
 
-git fetch --all --tags --prune >/dev/null 2>&1 || true
 if git rev-parse --verify "$REF" >/dev/null 2>&1; then
   git checkout -q "$REF"
 else
