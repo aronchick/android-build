@@ -6,6 +6,7 @@ BINARY_NAME="expanso-edge"
 VERSION="${EXPANSO_VERSION:-latest}"
 TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 INSTALL_DIR="${EXPANSO_INSTALL_DIR:-}"
+CURRENT_DIR="$(pwd)"
 
 if [ -z "$TOKEN" ]; then
   echo "Error: GITHUB_TOKEN (or GH_TOKEN) is required for this private repo." >&2
@@ -26,13 +27,56 @@ case "$arch_raw" in
     ;;
 esac
 
-if [ -z "$INSTALL_DIR" ]; then
-  if [ -n "${PREFIX:-}" ] && [ -d "${PREFIX}/bin" ]; then
-    INSTALL_DIR="${PREFIX}/bin"
-  else
-    INSTALL_DIR="/usr/local/bin"
+choose_install_dir() {
+  if [ -n "$INSTALL_DIR" ]; then
+    echo "Using install directory from EXPANSO_INSTALL_DIR: $INSTALL_DIR"
+    return
   fi
-fi
+
+  echo "Selecting install directory..."
+
+  candidates="/usr/local/bin /opt/bin"
+  if [ -n "${PREFIX:-}" ]; then
+    candidates="${candidates} ${PREFIX}/bin"
+  fi
+  if [ -n "${HOME:-}" ]; then
+    candidates="${candidates} ${HOME}/.local/bin"
+  fi
+  candidates="${candidates} ${CURRENT_DIR}"
+
+  for dir in $candidates; do
+    echo "Checking install directory: $dir"
+    if [ -d "$dir" ]; then
+      if [ -w "$dir" ]; then
+        INSTALL_DIR="$dir"
+        echo "Selected install directory: $INSTALL_DIR"
+        return
+      fi
+      echo "  $dir is not writable."
+      continue
+    fi
+
+    case "$dir" in
+      "${HOME:-}/.local/bin"|"$CURRENT_DIR"|"${PREFIX:-}/bin")
+        if mkdir -p "$dir" 2>/dev/null; then
+          INSTALL_DIR="$dir"
+          echo "Selected install directory: $INSTALL_DIR"
+          return
+        fi
+        echo "  Unable to create $dir."
+        ;;
+      *)
+        echo "  $dir is not available."
+        ;;
+    esac
+  done
+
+  echo "No suitable install directory found."
+  echo "Set EXPANSO_INSTALL_DIR to a writable path and try again."
+  exit 1
+}
+
+choose_install_dir
 
 if [ "$VERSION" = "latest" ]; then
   release_api="https://api.github.com/repos/${REPO}/releases/latest"
