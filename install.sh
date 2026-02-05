@@ -88,8 +88,16 @@ asset_name="${BINARY_NAME}-android-${arch}"
 if command -v jq >/dev/null 2>&1; then
   asset_url="$(printf '%s' "$json" | jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' | head -n 1)"
 else
-  # Best-effort JSON parse without jq (handles optional whitespace).
-  asset_url="$(printf '%s' "$json" | tr -d '\n' | sed -n "s/.*\"name\"[[:space:]]*:[[:space:]]*\"${asset_name}\"[^}]*\"browser_download_url\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p")"
+  # Best-effort JSON parse without jq (line-based on GitHub's pretty JSON).
+  asset_url="$(printf '%s\n' "$json" | awk -v name="$asset_name" '
+    $0 ~ "\"name\"[[:space:]]*:[[:space:]]*\""name"\"" { found=1 }
+    found && $0 ~ "\"browser_download_url\"[[:space:]]*:" {
+      gsub(/.*\"browser_download_url\"[[:space:]]*:[[:space:]]*\"/, "");
+      gsub(/\".*/, "");
+      print;
+      exit
+    }
+  ')"
 fi
 
 if [ -z "$asset_url" ]; then
