@@ -1,0 +1,59 @@
+From 274b6304ca19b818f42d19a252b91aa637cb239d Mon Sep 17 00:00:00 2001
+From: David Aronchick <aronchick@gmail.com>
+Date: Thu, 5 Feb 2026 00:38:20 -0800
+Subject: [PATCH] chore(flags): reuse env bool helper
+
+---
+ edge/cmd/flags/service.go | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/edge/cmd/flags/service.go b/edge/cmd/flags/service.go
+index a7757cf9..69ea6e3a 100644
+--- a/edge/cmd/flags/service.go
++++ b/edge/cmd/flags/service.go
+@@ -16,6 +16,15 @@ const (
+ 	EnvBootstrapForceIPv4 = "EXPANSO_EDGE_BOOTSTRAP_FORCE_IPV4"
+ )
+ 
++const (
++	envBoolTrue = "true"
++	envBoolOne  = "1"
++)
++
++func envBool(value string) bool {
++	return value == envBoolTrue || value == envBoolOne
++}
++
+ // ResolveBootstrapToken returns the bootstrap token, checking CLI value first then env var
+ func ResolveBootstrapToken(cliValue string) string {
+ 	if cliValue != "" {
+@@ -37,7 +46,7 @@ func ResolveBootstrapInsecure(cliValue bool) bool {
+ 	if cliValue {
+ 		return true
+ 	}
+-	return os.Getenv(EnvBootstrapInsecure) == "true" || os.Getenv(EnvBootstrapInsecure) == "1"
++	return envBool(os.Getenv(EnvBootstrapInsecure))
+ }
+ 
+ // ResolveBootstrapNoProxy returns true when proxy usage should be disabled
+@@ -45,7 +54,7 @@ func ResolveBootstrapNoProxy(cliValue bool) bool {
+ 	if cliValue {
+ 		return true
+ 	}
+-	return os.Getenv(EnvBootstrapNoProxy) == "true" || os.Getenv(EnvBootstrapNoProxy) == "1"
++	return envBool(os.Getenv(EnvBootstrapNoProxy))
+ }
+ 
+ // ResolveBootstrapForceIPv4 returns true when bootstrap should force IPv4
+@@ -53,7 +62,7 @@ func ResolveBootstrapForceIPv4(cliValue bool) bool {
+ 	if cliValue {
+ 		return true
+ 	}
+-	return os.Getenv(EnvBootstrapForceIPv4) == "true" || os.Getenv(EnvBootstrapForceIPv4) == "1"
++	return envBool(os.Getenv(EnvBootstrapForceIPv4))
+ }
+ 
+ // ServiceConfig holds all configuration for the service command
+-- 
+2.52.0
+

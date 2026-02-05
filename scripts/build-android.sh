@@ -84,6 +84,10 @@ LDFLAGS=(
 if [[ -d "$PATCH_DIR" ]]; then
   shopt -s nullglob
   for patch in "$PATCH_DIR"/*.patch; do
+    if git apply --reverse --check "$patch" >/dev/null 2>&1; then
+      echo "Skipping already-applied patch $(basename "$patch")"
+      continue
+    fi
     echo "Applying patch $(basename "$patch")"
     if ! git apply "$patch"; then
       echo "Patch failed, attempting 3-way apply..." >&2

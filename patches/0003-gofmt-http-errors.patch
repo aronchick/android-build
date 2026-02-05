@@ -1,0 +1,25 @@
+From ada63ff856a3233049d2c27e0dd8726b3bed3494 Mon Sep 17 00:00:00 2001
+From: David Aronchick <aronchick@gmail.com>
+Date: Thu, 5 Feb 2026 00:22:35 -0800
+Subject: [PATCH] gofmt http errors
+
+---
+ shared/http/errors.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/shared/http/errors.go b/shared/http/errors.go
+index ad743196..e05ac2a7 100644
+--- a/shared/http/errors.go
++++ b/shared/http/errors.go
+@@ -184,7 +184,7 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
+ 	case strings.Contains(errStr, "broken pipe"):
+ 		return withRootCause(errors.Newf("connection to %s was broken during data transfer", host).
+ 			WithCode(errors.CodeNetworkError).
+-			WithHint("The connection was interrupted. " +
++			WithHint("The connection was interrupted. "+
+ 				"This often happens when the server closes the connection while data is being sent"), rootErr)
+ 	case strings.Contains(errStr, "certificate") || strings.Contains(errStr, "x509"):
+ 		return withRootCause(errors.Newf("TLS certificate validation failed for %s", host).
+-- 
+2.52.0
+

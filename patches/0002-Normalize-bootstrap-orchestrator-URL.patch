@@ -1,0 +1,134 @@
+From cc5dec6e8eddf0afc20753ed6e238aa59724226c Mon Sep 17 00:00:00 2001
+From: David Aronchick <aronchick@gmail.com>
+Date: Thu, 5 Feb 2026 00:17:41 -0800
+Subject: [PATCH] Normalize bootstrap orchestrator URL
+
+---
+ shared/bootstrap/service.go      | 28 +++++++++++++++++++++-
+ shared/bootstrap/service_test.go | 40 ++++++++++++++++++++++++++++++--
+ 2 files changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/shared/bootstrap/service.go b/shared/bootstrap/service.go
+index 295fa5e2..f6c8b4ca 100644
+--- a/shared/bootstrap/service.go
++++ b/shared/bootstrap/service.go
+@@ -5,8 +5,11 @@ import (
+ 	"encoding/base64"
+ 	"fmt"
+ 	"log/slog"
++	"net"
++	"net/url"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 
+ 	"github.com/expanso-io/expanso/lib/errors"
+ 	"github.com/expanso-io/expanso/shared/config"
+@@ -209,10 +212,11 @@ func (s *BootstrapService) doBootstrap(
+ 	}
+ 
+ 	// Create credentials struct
++	orchestratorURL := normalizeOrchestratorURL(resp.OrchestratorURL)
+ 	connConfig := types.ConnectionConfig{
+ 		NodeID:          resp.NodeID,
+ 		NetworkID:       resp.NetworkID,
+-		Address:         resp.OrchestratorURL,
++		Address:         orchestratorURL,
+ 		RequireTLS:      true, // Always use TLS for orchestrator connections
+ 		CredentialsPath: filepath.Join(s.configManager.GetConfig().GetAuthDir(), "credentials.creds"),
+ 		CACerts:         resp.CACerts,
+@@ -256,6 +260,28 @@ func (s *BootstrapService) doBootstrap(
+ 	return credentialsInfo, nil
+ }
+ 
++func normalizeOrchestratorURL(raw string) string {
++	trimmed := strings.TrimSpace(raw)
++	if trimmed == "" {
++		return ""
++	}
++
++	if !strings.Contains(trimmed, "://") {
++		trimmed = "nats://" + trimmed
++	}
++
++	parsed, err := url.Parse(trimmed)
++	if err != nil || parsed.Hostname() == "" {
++		return raw
++	}
++
++	if parsed.Port() == "" {
++		parsed.Host = net.JoinHostPort(parsed.Hostname(), "4222")
++	}
++
++	return parsed.String()
++}
++
+ // WriteCredentials writes credentials config and credential file to disk, then triggers reload
+ func (s *BootstrapService) writeCredentials(path string, credsContent []byte) error {
+ 	// Get config to determine auth directory
+diff --git a/shared/bootstrap/service_test.go b/shared/bootstrap/service_test.go
+index d49e808b..9d253ab3 100644
+--- a/shared/bootstrap/service_test.go
++++ b/shared/bootstrap/service_test.go
+@@ -1057,13 +1057,14 @@ func (s *BootstrapServiceWithServerTestSuite) TestDoBootstrapSetsAllConnectionCo
+ 
+ 	expectedNodeID := "node-xyz789"
+ 	expectedNetworkID := "network-prod-001"
+-	expectedOrchestratorURL := "orchestrator.prod.example.com:4222"
++	rawOrchestratorURL := "orchestrator.prod.example.com:4222"
++	expectedOrchestratorURL := "nats://orchestrator.prod.example.com:4222"
+ 
+ 	// Setup: Create test server with all fields
+ 	s.testServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		response := &BootstrapResponse{
+ 			ClientCreds:     string(newValidNATSCredentialsContent()),
+-			OrchestratorURL: expectedOrchestratorURL,
++			OrchestratorURL: rawOrchestratorURL,
+ 			NetworkID:       expectedNetworkID,
+ 			NodeID:          expectedNodeID,
+ 			Telemetry: BootstrapTelemetryInfo{
+@@ -1105,6 +1106,41 @@ func (s *BootstrapServiceWithServerTestSuite) TestDoBootstrapSetsAllConnectionCo
+ 	s.Equal(expectedOrchestratorURL, persistedConfig.Address)
+ }
+ 
++func (s *BootstrapServiceWithServerTestSuite) TestDoBootstrapAddsDefaultPortWhenMissing() {
++	s.T().Helper()
++
++	expectedNodeID := "node-abc123"
++	expectedNetworkID := "network-prod-002"
++	rawOrchestratorURL := "orchestrator.prod.example.com"
++	expectedOrchestratorURL := "nats://orchestrator.prod.example.com:4222"
++
++	s.testServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		response := &BootstrapResponse{
++			ClientCreds:     string(newValidNATSCredentialsContent()),
++			OrchestratorURL: rawOrchestratorURL,
++			NetworkID:       expectedNetworkID,
++			NodeID:          expectedNodeID,
++		}
++		w.Header().Set("Content-Type", "application/json")
++		json.NewEncoder(w).Encode(response)
++	}))
++
++	ctx := context.Background()
++
++	info, err := s.service.Bootstrap(ctx, BootstrapOptions{
++		Token: "bootstrap-token",
++		URL:   s.testServer.URL,
++		Force: true,
++	})
++
++	s.NoError(err)
++	s.NotNil(info)
++	s.Equal(expectedOrchestratorURL, info.ConnectionConfig.Address)
++
++	persistedConfig := s.mockConfigManager.GetConnectionConfig()
++	s.Equal(expectedOrchestratorURL, persistedConfig.Address)
++}
++
+ func (s *BootstrapServiceWithServerTestSuite) TestDoBootstrapSetsCACerts() {
+ 	s.T().Helper()
+ 
+-- 
+2.52.0
+

@@ -1,0 +1,40 @@
+From 88e9879054e380b152fd51ac685361792b5dd796 Mon Sep 17 00:00:00 2001
+From: David Aronchick <aronchick@gmail.com>
+Date: Thu, 5 Feb 2026 08:44:56 -0800
+Subject: [PATCH] fix(telemetry): enable Android process metrics
+
+---
+ docs/architecture/metrics/published/PROCESS_METRICS.md | 4 ++--
+ shared/telemetry/process_metrics_unix.go               | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/docs/architecture/metrics/published/PROCESS_METRICS.md b/docs/architecture/metrics/published/PROCESS_METRICS.md
+index baa7933a..89fe688f 100644
+--- a/docs/architecture/metrics/published/PROCESS_METRICS.md
++++ b/docs/architecture/metrics/published/PROCESS_METRICS.md
+@@ -248,8 +248,8 @@ Process metrics can be tested by:
+ Platform-specific files use Go build constraints:
+ 
+ ```go
+-//go:build linux
+-// +build linux
++//go:build linux || android
++// +build linux android
+ 
+ //go:build darwin
+ // +build darwin
+diff --git a/shared/telemetry/process_metrics_unix.go b/shared/telemetry/process_metrics_unix.go
+index 3b0a7e07..3b9e6fa0 100644
+--- a/shared/telemetry/process_metrics_unix.go
++++ b/shared/telemetry/process_metrics_unix.go
+@@ -1,5 +1,5 @@
+-//go:build linux
+-// +build linux
++//go:build linux || android
++// +build linux android
+ 
+ package telemetry
+ 
+-- 
+2.52.0
+
