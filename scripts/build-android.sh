@@ -39,7 +39,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 WORK_DIR="$(mktemp -d)"
-cleanup() { rm -rf "$WORK_DIR"; }
+cleanup() {
+  chmod -R u+w "$WORK_DIR" 2>/dev/null || true
+  rm -rf "$WORK_DIR" || true
+}
 trap cleanup EXIT
 
 MODCACHE_DIR="$WORK_DIR/gomodcache"
