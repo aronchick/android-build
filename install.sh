@@ -85,7 +85,12 @@ else
   json="$(curl -fsSL "$release_api")"
 fi
 asset_name="${BINARY_NAME}-android-${arch}"
-asset_url="$(printf '%s' "$json" | tr -d '\n' | sed -n "s/.*\"name\":\"${asset_name}\"[^}]*\"browser_download_url\":\"\([^\"]*\)\".*/\1/p")"
+if command -v jq >/dev/null 2>&1; then
+  asset_url="$(printf '%s' "$json" | jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' | head -n 1)"
+else
+  # Best-effort JSON parse without jq (handles optional whitespace).
+  asset_url="$(printf '%s' "$json" | tr -d '\n' | sed -n "s/.*\"name\"[[:space:]]*:[[:space:]]*\"${asset_name}\"[^}]*\"browser_download_url\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p")"
+fi
 
 if [ -z "$asset_url" ]; then
   echo "Error: release asset not found for ${asset_name} (version: ${VERSION})." >&2
