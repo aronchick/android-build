@@ -86,18 +86,13 @@ else
 fi
 asset_name="${BINARY_NAME}-android-${arch}"
 # Best-effort JSON parse without extra tools (line-based on GitHub's pretty JSON).
-asset_url="$(printf '%s\n' "$json" | awk -v name="$asset_name" '
-  $0 ~ "\"name\"[[:space:]]*:[[:space:]]*\""name"\"" { found=1 }
-  found && $0 ~ "\"browser_download_url\"[[:space:]]*:" {
-    gsub(/.*\"browser_download_url\"[[:space:]]*:[[:space:]]*\"/, "");
-    gsub(/\".*/, "");
-    print;
-    exit
-  }
+asset_url="$(printf '%s\n' "$json" | awk -F'"' -v name="$asset_name" '
+  $2 == "name" && $4 == name { found=1; next }
+  found && $2 == "browser_download_url" { print $4; exit }
 ')"
 
 if [ -z "$asset_url" ]; then
-  message="$(printf '%s\n' "$json" | awk -F'\"' '/\"message\"[[:space:]]*:/ { print $4; exit }')"
+  message="$(printf '%s\n' "$json" | awk -F'"' '$2 == "message" { print $4; exit }')"
   if [ -n "$message" ]; then
     echo "GitHub API error: $message" >&2
   fi
