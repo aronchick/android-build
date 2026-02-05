@@ -8,11 +8,6 @@ TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 INSTALL_DIR="${EXPANSO_INSTALL_DIR:-}"
 CURRENT_DIR="$(pwd)"
 
-if [ -z "$TOKEN" ]; then
-  echo "Error: GITHUB_TOKEN (or GH_TOKEN) is required for this private repo." >&2
-  exit 1
-fi
-
 arch_raw="$(uname -m)"
 case "$arch_raw" in
   aarch64|arm64)
@@ -84,7 +79,11 @@ else
   release_api="https://api.github.com/repos/${REPO}/releases/tags/${VERSION}"
 fi
 
-json="$(curl -fsSL -H "Authorization: token ${TOKEN}" "$release_api")"
+if [ -n "$TOKEN" ]; then
+  json="$(curl -fsSL -H "Authorization: token ${TOKEN}" "$release_api")"
+else
+  json="$(curl -fsSL "$release_api")"
+fi
 asset_name="${BINARY_NAME}-android-${arch}"
 asset_url="$(printf '%s' "$json" | tr -d '\n' | sed -n "s/.*\"name\":\"${asset_name}\"[^}]*\"browser_download_url\":\"\([^\"]*\)\".*/\1/p")"
 
@@ -96,7 +95,11 @@ fi
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-curl -fL -H "Authorization: token ${TOKEN}" -o "$tmp_dir/${BINARY_NAME}" "$asset_url"
+if [ -n "$TOKEN" ]; then
+  curl -fL -H "Authorization: token ${TOKEN}" -o "$tmp_dir/${BINARY_NAME}" "$asset_url"
+else
+  curl -fL -o "$tmp_dir/${BINARY_NAME}" "$asset_url"
+fi
 chmod +x "$tmp_dir/${BINARY_NAME}"
 
 mkdir -p "$INSTALL_DIR"
