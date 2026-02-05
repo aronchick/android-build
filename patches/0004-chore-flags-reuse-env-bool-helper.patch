@@ -1,4 +1,4 @@
-From 274b6304ca19b818f42d19a252b91aa637cb239d Mon Sep 17 00:00:00 2001
+From ae76d8d2cce50074cdffa94b3c2f3fd50ffd858e Mon Sep 17 00:00:00 2001
 From: David Aronchick <aronchick@gmail.com>
 Date: Thu, 5 Feb 2026 00:38:20 -0800
 Subject: [PATCH] chore(flags): reuse env bool helper

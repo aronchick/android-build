@@ -1,4 +1,4 @@
-From ada63ff856a3233049d2c27e0dd8726b3bed3494 Mon Sep 17 00:00:00 2001
+From e0e13f02312083d315f355e1967983308f172a43 Mon Sep 17 00:00:00 2001
 From: David Aronchick <aronchick@gmail.com>
 Date: Thu, 5 Feb 2026 00:22:35 -0800
 Subject: [PATCH] gofmt http errors

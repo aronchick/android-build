@@ -1,13 +1,47 @@
-diff --git a/edge/internal/node/info_provider.go b/edge/internal/node/info_provider.go
-index f3b94a65..f33e027e 100644
---- a/edge/internal/node/info_provider.go
-+++ b/edge/internal/node/info_provider.go
-@@ -74,7 +74,7 @@ func hostname() string {
- //	on VMs created from the same image
- func machineID() string {
- 	id, err := machineid.ID()
--	if err != nil {
-+	if err != nil || id == "" {
- 		return "unknown"
- 	}
- 	return id
+From 75ddaf77f176cda6b94cc3a0213fa8d976d3cfca Mon Sep 17 00:00:00 2001
+From: David Aronchick <aronchick@gmail.com>
+Date: Thu, 5 Feb 2026 00:26:34 -0800
+Subject: [PATCH] chore: drop unrelated readiness change
+
+---
+ edge/internal/executor/pipeline/runner.go | 10 +---------
+ 1 file changed, 1 insertion(+), 9 deletions(-)
+
+diff --git a/edge/internal/executor/pipeline/runner.go b/edge/internal/executor/pipeline/runner.go
+index 018ad5e2..66e1d31c 100644
+--- a/edge/internal/executor/pipeline/runner.go
++++ b/edge/internal/executor/pipeline/runner.go
+@@ -419,9 +419,6 @@ func (r *Runner) waitForReady(ctx context.Context) error {
+ 	ticker := time.NewTicker(r.params.ReadinessCheckInterval)
+ 	defer ticker.Stop()
+ 
+-	// Track the last readiness check error to include in timeout message
+-	var lastReadinessErr error
+-
+ 	for {
+ 		select {
+ 		case <-r.terminalCh:
+@@ -454,10 +451,6 @@ func (r *Runner) waitForReady(ctx context.Context) error {
+ 		case <-timeout:
+ 			// Transition to Failed state (reconciler will decide if retry)
+ 			timeoutErr := errors.Timeout("pipeline readiness", r.params.ReadinessWaitTimeout.String())
+-			// Add context about the last check error if available
+-			if lastReadinessErr != nil {
+-				timeoutErr = timeoutErr.WithDetail("last_check_error", lastReadinessErr.Error())
+-			}
+ 			_ = r.transition(func(s *pipelineState) error {
+ 				s.lastError = timeoutErr
+ 				return s.setState(types.ExecutionStateFailed,
+@@ -468,8 +461,7 @@ func (r *Runner) waitForReady(ctx context.Context) error {
+ 		case <-ticker.C:
+ 			ready, err := r.httpClient.IsReady(ctx)
+ 			if err != nil {
+-				lastReadinessErr = err // Store for timeout context
+-				r.logger.Info("Readiness check failed", "error", err)
++				r.logger.Debug("Failed to check readiness", "error", err)
+ 				continue
+ 			}
+ 
+-- 
+2.52.0
+

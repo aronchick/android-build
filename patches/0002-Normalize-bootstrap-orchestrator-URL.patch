@@ -1,4 +1,4 @@
-From cc5dec6e8eddf0afc20753ed6e238aa59724226c Mon Sep 17 00:00:00 2001
+From ab32e38f7a7b21fd081437c34457b231fd943f52 Mon Sep 17 00:00:00 2001
 From: David Aronchick <aronchick@gmail.com>
 Date: Thu, 5 Feb 2026 00:17:41 -0800
 Subject: [PATCH] Normalize bootstrap orchestrator URL
