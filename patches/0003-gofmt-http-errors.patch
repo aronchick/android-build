@@ -1,25 +1,130 @@
-From e0e13f02312083d315f355e1967983308f172a43 Mon Sep 17 00:00:00 2001
-From: David Aronchick <aronchick@gmail.com>
-Date: Thu, 5 Feb 2026 00:22:35 -0800
-Subject: [PATCH] gofmt http errors
-
----
- shared/http/errors.go | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
 diff --git a/shared/http/errors.go b/shared/http/errors.go
-index ad743196..e05ac2a7 100644
+index d0b8b607..e05ac2a7 100644
 --- a/shared/http/errors.go
 +++ b/shared/http/errors.go
-@@ -184,7 +184,7 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
+@@ -108,6 +108,8 @@ func createHTTPStatusError(resp *req.Response) *errors.Error {
+ 
+ // handleNetworkError categorizes network errors more precisely
+ func handleNetworkError(err error, reqURL string) *errors.Error {
++	rootErr := err.Error()
++
+ 	// Parse URL to get host and port for better error messages
+ 	parsedURL, _ := url.Parse(reqURL)
+ 	host := parsedURL.Host
+@@ -127,10 +129,15 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
+ 		// Check the underlying error
+ 		errStr := urlErr.Err.Error()
+ 		switch {
++		case strings.Contains(errStr, "proxyconnect"):
++			return withRootCause(errors.Newf("proxy connection failed while reaching %s", host).
++				WithCode(errors.CodeServiceUnavailable).
++				WithHint("Check HTTP_PROXY/HTTPS_PROXY/NO_PROXY environment variables and proxy availability").
++				WithDetail("proxy_error", errStr), rootErr)
+ 		case strings.Contains(errStr, "no such host"):
+-			return errors.Newf("unable to resolve host '%s'", parsedURL.Hostname()).
++			return withRootCause(errors.Newf("unable to resolve host '%s'", parsedURL.Hostname()).
+ 				WithCode(errors.CodeBadRequest).
+-				WithHint("Check if the hostname is spelled correctly and that DNS is working")
++				WithHint("Check if the hostname is spelled correctly and that DNS is working"), rootErr)
+ 		case strings.Contains(errStr, "connection refused"):
+ 			hint := fmt.Sprintf(`The server at %s refused the connection. To resolve this:
+ 1. Ensure the server is running
+@@ -138,9 +145,9 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
+ 3. Verify firewall settings allow the connection
+ 4. If using localhost, ensure the service is bound to the correct interface`, host)
+ 
+-			return errors.Newf("connection refused by server at %s", host).
++			return withRootCause(errors.Newf("connection refused by server at %s", host).
+ 				WithCode(errors.CodeServiceUnavailable).
+-				WithHint(hint)
++				WithHint(hint), rootErr)
+ 		}
+ 	}
+ 
+@@ -148,17 +155,17 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
+ 	var netErr net.Error
+ 	if stderrors.As(err, &netErr) {
+ 		if netErr.Timeout() {
+-			return errors.Newf("network operation timed out while connecting to %s", host).
++			return withRootCause(errors.Newf("network operation timed out while connecting to %s", host).
+ 				WithCode(errors.CodeTimeout).
+-				WithHint("This might be due to network issues or an unresponsive server")
++				WithHint("This might be due to network issues or an unresponsive server"), rootErr)
+ 		}
+ 
+ 		// Check for specific network operation errors
+ 		if opErr, ok := netErr.(*net.OpError); ok {
+ 			if opErr.Op == "dial" {
+-				return errors.Newf("failed to establish connection to %s", host).
++				return withRootCause(errors.Newf("failed to establish connection to %s", host).
+ 					WithCode(errors.CodeServiceUnavailable).
+-					WithHint("The server might be down or unreachable. Check network connectivity and server status")
++					WithHint("The server might be down or unreachable. Check network connectivity and server status"), rootErr)
+ 			}
+ 		}
+ 	}
+@@ -167,26 +174,33 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
+ 	errStr := err.Error()
+ 	switch {
+ 	case strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline exceeded"):
+-		return errors.Newf("request to %s timed out", host).
++		return withRootCause(errors.Newf("request to %s timed out", host).
+ 			WithCode(errors.CodeTimeout).
+-			WithHint("The operation took too long. Consider increasing the timeout or checking server performance")
++			WithHint("The operation took too long. Consider increasing the timeout or checking server performance"), rootErr)
+ 	case strings.Contains(errStr, "connection reset"):
+-		return errors.Newf("connection to %s was reset by the server", host).
++		return withRootCause(errors.Newf("connection to %s was reset by the server", host).
+ 			WithCode(errors.CodeServiceUnavailable).
+-			WithHint("The server closed the connection unexpectedly. This might indicate a server issue or network problem")
++			WithHint("The server closed the connection unexpectedly. This might indicate a server issue or network problem"), rootErr)
  	case strings.Contains(errStr, "broken pipe"):
- 		return withRootCause(errors.Newf("connection to %s was broken during data transfer", host).
+-		return errors.Newf("connection to %s was broken during data transfer", host).
++		return withRootCause(errors.Newf("connection to %s was broken during data transfer", host).
  			WithCode(errors.CodeNetworkError).
 -			WithHint("The connection was interrupted. " +
+-				"This often happens when the server closes the connection while data is being sent")
 +			WithHint("The connection was interrupted. "+
- 				"This often happens when the server closes the connection while data is being sent"), rootErr)
++				"This often happens when the server closes the connection while data is being sent"), rootErr)
  	case strings.Contains(errStr, "certificate") || strings.Contains(errStr, "x509"):
- 		return withRootCause(errors.Newf("TLS certificate validation failed for %s", host).
--- 
-2.52.0
-
+-		return errors.Newf("TLS certificate validation failed for %s", host).
++		return withRootCause(errors.Newf("TLS certificate validation failed for %s", host).
+ 			WithCode(errors.CodeBadRequest).
+-			WithHint("The server's certificate is invalid or untrusted. Verify the certificate or use proper CA certificates")
++			WithHint("The server's certificate is invalid or untrusted. Verify the certificate or use proper CA certificates"), rootErr)
+ 	default:
+ 		// Generic network error
+-		return errors.Newf("network error occurred while connecting to %s: %v", host, err).
++		return withRootCause(errors.Newf("network error occurred while connecting to %s: %v", host, err).
+ 			WithCode(errors.CodeNetworkError).
+-			WithHint("Check your network connection and try again")
++			WithHint("Check your network connection and try again"), rootErr)
++	}
++}
++
++func withRootCause(err *errors.Error, root string) *errors.Error {
++	if root != "" {
++		err = err.WithDetail("root_error", root)
+ 	}
++	return err
+ }
+diff --git a/shared/http/errors_test.go b/shared/http/errors_test.go
+index d58a04c6..1d75d76b 100644
+--- a/shared/http/errors_test.go
++++ b/shared/http/errors_test.go
+@@ -87,6 +87,7 @@ func TestTransformError_NetworkError(t *testing.T) {
+ 	assert.Equal(t, "HTTPClient", err.Component)
+ 	assert.Equal(t, "http://invalid-domain-that-does-not-exist-12345.com", err.Details["url"])
+ 	assert.Equal(t, "GET", err.Details["method"])
++	assert.NotEmpty(t, err.Details["root_error"])
+ 	assert.Contains(t, err.Message, "unable to resolve host")
+ 	assert.Contains(t, err.Hint, "Check if the hostname is spelled correctly")
+ }
+@@ -160,6 +161,7 @@ func TestTransformError_ConnectionRefused(t *testing.T) {
+ 	require.NotNil(t, err)
+ 	assert.Equal(t, errors.CodeServiceUnavailable, err.Code)
+ 	assert.Equal(t, "HTTPClient", err.Component)
++	assert.NotEmpty(t, err.Details["root_error"])
+ 	assert.Contains(t, err.Message, "connection refused")
+ 	assert.Contains(t, err.Hint, "Ensure the server is running")
+ }
