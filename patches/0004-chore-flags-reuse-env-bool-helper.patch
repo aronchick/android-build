@@ -1,18 +1,131 @@
-From ae76d8d2cce50074cdffa94b3c2f3fd50ffd858e Mon Sep 17 00:00:00 2001
-From: David Aronchick <aronchick@gmail.com>
-Date: Thu, 5 Feb 2026 00:38:20 -0800
-Subject: [PATCH] chore(flags): reuse env bool helper
-
----
- edge/cmd/flags/service.go | 15 ++++++++++++---
- 1 file changed, 12 insertions(+), 3 deletions(-)
-
+diff --git a/edge/cmd/commands/bootstrap.go b/edge/cmd/commands/bootstrap.go
+index 8e8b373d..b8774ffa 100644
+--- a/edge/cmd/commands/bootstrap.go
++++ b/edge/cmd/commands/bootstrap.go
+@@ -22,6 +22,8 @@ type bootstrapConfig struct {
+ 	DataDir        string
+ 	Force          bool
+ 	Insecure       bool
++	NoProxy        bool
++	ForceIPv4      bool
+ }
+ 
+ // NewBootstrapCommand creates the bootstrap command
+@@ -95,6 +97,8 @@ Examples:
+ 	cmd.Flags().StringVarP(&cfg.BootstrapURL, "url", "u", "", "Bootstrap service URL (advanced)")
+ 	cmd.Flags().BoolVarP(&cfg.Force, "force", "f", false, "Force re-bootstrap even if already bootstrapped")
+ 	cmd.Flags().BoolVarP(&cfg.Insecure, "insecure", "k", false, "Skip TLS certificate verification")
++	cmd.Flags().BoolVar(&cfg.NoProxy, "no-proxy", false, "Disable HTTP proxy usage for bootstrap requests")
++	cmd.Flags().BoolVar(&cfg.ForceIPv4, "force-ipv4", false, "Force IPv4 for bootstrap requests (useful on networks with broken IPv6)")
+ 
+ 	cmd.PersistentFlags().StringSliceVarP(&cfg.ConfigPaths, "config", "c", nil, "Paths to configuration files or directories")
+ 	cmd.Flags().StringVar(&cfg.DataDir, "data-dir", "", "Data directory path")
+@@ -132,11 +136,15 @@ func runBootstrap(cmd *cobra.Command, cfg *bootstrapConfig) error {
+ 	token := flags.ResolveBootstrapToken(cfg.BootstrapToken)
+ 	url := flags.ResolveBootstrapURL(cfg.BootstrapURL)
+ 	insecure := flags.ResolveBootstrapInsecure(cfg.Insecure)
++	disableProxy := flags.ResolveBootstrapNoProxy(cfg.NoProxy)
++	forceIPv4 := flags.ResolveBootstrapForceIPv4(cfg.ForceIPv4)
+ 	_, err = bootstrapService.Bootstrap(ctx, bootstrap.BootstrapOptions{
+-		Token:    token,
+-		URL:      url,
+-		Force:    cfg.Force,
+-		Insecure: insecure,
++		Token:        token,
++		URL:          url,
++		Force:        cfg.Force,
++		Insecure:     insecure,
++		DisableProxy: disableProxy,
++		ForceIPv4:    forceIPv4,
+ 	})
+ 	if err != nil {
+ 		// Handle already bootstrapped case gracefully
+diff --git a/edge/cmd/commands/run.go b/edge/cmd/commands/run.go
+index 937a8d1b..802c32b8 100644
+--- a/edge/cmd/commands/run.go
++++ b/edge/cmd/commands/run.go
+@@ -96,7 +96,15 @@ func runServiceDirectly(cmd *cobra.Command, cfg *flags.ServiceRunConfig) error {
+ 		return err
+ 	}
+ 
+-	if err = ensureRegistered(ctx, cfg.GetBootstrapToken(), cfg.GetBootstrapURL(), cfg.GetBootstrapInsecure(), configManager); err != nil {
++	if err = ensureRegistered(
++		ctx,
++		cfg.GetBootstrapToken(),
++		cfg.GetBootstrapURL(),
++		cfg.GetBootstrapInsecure(),
++		cfg.GetBootstrapNoProxy(),
++		cfg.GetBootstrapForceIPv4(),
++		configManager,
++	); err != nil {
+ 		return err
+ 	}
+ 
+@@ -157,7 +165,15 @@ func runWithSupervisor(cmd *cobra.Command, cfg *flags.ServiceRunConfig) error {
+ 		return err
+ 	}
+ 
+-	if err = ensureRegistered(ctx, cfg.GetBootstrapToken(), cfg.GetBootstrapURL(), cfg.GetBootstrapInsecure(), configManager); err != nil {
++	if err = ensureRegistered(
++		ctx,
++		cfg.GetBootstrapToken(),
++		cfg.GetBootstrapURL(),
++		cfg.GetBootstrapInsecure(),
++		cfg.GetBootstrapNoProxy(),
++		cfg.GetBootstrapForceIPv4(),
++		configManager,
++	); err != nil {
+ 		return err
+ 	}
+ 
+@@ -215,7 +231,15 @@ func loadConfig(cmd *cobra.Command, configPaths []string) (interfaces.EdgeConfig
+ 	return configManager, loader, nil
+ }
+ 
+-func ensureRegistered(ctx context.Context, token, url string, insecure bool, configManager interfaces.EdgeConfigManager) error {
++func ensureRegistered(
++	ctx context.Context,
++	token string,
++	url string,
++	insecure bool,
++	disableProxy bool,
++	forceIPv4 bool,
++	configManager interfaces.EdgeConfigManager,
++) error {
+ 	// If explicit local mode, skip bootstrap
+ 	if configManager.Current().LocalMode {
+ 		return nil
+@@ -224,9 +248,11 @@ func ensureRegistered(ctx context.Context, token, url string, insecure bool, con
+ 	// Not in local mode - attempt bootstrap
+ 	bootstrapService := bootstrap.NewBootstrapService(configManager, nil)
+ 	_, err := bootstrapService.EnsureBootstrapped(ctx, bootstrap.BootstrapOptions{
+-		Token:    token,
+-		URL:      url,
+-		Insecure: insecure,
++		Token:        token,
++		URL:          url,
++		Insecure:     insecure,
++		DisableProxy: disableProxy,
++		ForceIPv4:    forceIPv4,
+ 	})
+ 	if err != nil {
+ 		return errors.Wrap(err, "failed to connect edge node")
 diff --git a/edge/cmd/flags/service.go b/edge/cmd/flags/service.go
-index a7757cf9..69ea6e3a 100644
+index 0d15345a..69ea6e3a 100644
 --- a/edge/cmd/flags/service.go
 +++ b/edge/cmd/flags/service.go
-@@ -16,6 +16,15 @@ const (
- 	EnvBootstrapForceIPv4 = "EXPANSO_EDGE_BOOTSTRAP_FORCE_IPV4"
+@@ -9,11 +9,22 @@ import (
+ 
+ // Bootstrap environment variable names
+ const (
+-	EnvBootstrapToken    = "EXPANSO_EDGE_BOOTSTRAP_TOKEN" //nolint:gosec // G101 false positive - env var name, not a credential
+-	EnvBootstrapURL      = "EXPANSO_EDGE_BOOTSTRAP_URL"
+-	EnvBootstrapInsecure = "EXPANSO_EDGE_BOOTSTRAP_INSECURE"
++	EnvBootstrapToken     = "EXPANSO_EDGE_BOOTSTRAP_TOKEN" //nolint:gosec // G101 false positive - env var name, not a credential
++	EnvBootstrapURL       = "EXPANSO_EDGE_BOOTSTRAP_URL"
++	EnvBootstrapInsecure  = "EXPANSO_EDGE_BOOTSTRAP_INSECURE"
++	EnvBootstrapNoProxy   = "EXPANSO_EDGE_BOOTSTRAP_NO_PROXY"
++	EnvBootstrapForceIPv4 = "EXPANSO_EDGE_BOOTSTRAP_FORCE_IPV4"
  )
  
 +const (
@@ -27,33 +140,500 @@ index a7757cf9..69ea6e3a 100644
  // ResolveBootstrapToken returns the bootstrap token, checking CLI value first then env var
  func ResolveBootstrapToken(cliValue string) string {
  	if cliValue != "" {
-@@ -37,7 +46,7 @@ func ResolveBootstrapInsecure(cliValue bool) bool {
+@@ -35,7 +46,23 @@ func ResolveBootstrapInsecure(cliValue bool) bool {
  	if cliValue {
  		return true
  	}
 -	return os.Getenv(EnvBootstrapInsecure) == "true" || os.Getenv(EnvBootstrapInsecure) == "1"
 +	return envBool(os.Getenv(EnvBootstrapInsecure))
- }
- 
- // ResolveBootstrapNoProxy returns true when proxy usage should be disabled
-@@ -45,7 +54,7 @@ func ResolveBootstrapNoProxy(cliValue bool) bool {
- 	if cliValue {
- 		return true
- 	}
--	return os.Getenv(EnvBootstrapNoProxy) == "true" || os.Getenv(EnvBootstrapNoProxy) == "1"
++}
++
++// ResolveBootstrapNoProxy returns true when proxy usage should be disabled
++func ResolveBootstrapNoProxy(cliValue bool) bool {
++	if cliValue {
++		return true
++	}
 +	return envBool(os.Getenv(EnvBootstrapNoProxy))
- }
- 
- // ResolveBootstrapForceIPv4 returns true when bootstrap should force IPv4
-@@ -53,7 +62,7 @@ func ResolveBootstrapForceIPv4(cliValue bool) bool {
- 	if cliValue {
- 		return true
- 	}
--	return os.Getenv(EnvBootstrapForceIPv4) == "true" || os.Getenv(EnvBootstrapForceIPv4) == "1"
++}
++
++// ResolveBootstrapForceIPv4 returns true when bootstrap should force IPv4
++func ResolveBootstrapForceIPv4(cliValue bool) bool {
++	if cliValue {
++		return true
++	}
 +	return envBool(os.Getenv(EnvBootstrapForceIPv4))
  }
  
  // ServiceConfig holds all configuration for the service command
--- 
-2.52.0
-
+@@ -50,9 +77,11 @@ type ServiceConfig struct {
+ 	Verbose      bool
+ 
+ 	// Bootstrap
+-	BootstrapToken    string
+-	BootstrapURL      string
+-	BootstrapInsecure bool
++	BootstrapToken     string
++	BootstrapURL       string
++	BootstrapInsecure  bool
++	BootstrapNoProxy   bool
++	BootstrapForceIPv4 bool
+ 
+ 	// Convenience flags
+ 	LocalMode bool
+@@ -73,6 +102,16 @@ func (c *ServiceConfig) GetBootstrapInsecure() bool {
+ 	return ResolveBootstrapInsecure(c.BootstrapInsecure)
+ }
+ 
++// GetBootstrapNoProxy returns whether bootstrap should skip proxy usage
++func (c *ServiceConfig) GetBootstrapNoProxy() bool {
++	return ResolveBootstrapNoProxy(c.BootstrapNoProxy)
++}
++
++// GetBootstrapForceIPv4 returns whether bootstrap should force IPv4
++func (c *ServiceConfig) GetBootstrapForceIPv4() bool {
++	return ResolveBootstrapForceIPv4(c.BootstrapForceIPv4)
++}
++
+ // ServiceRunConfig holds all configuration for the service run command
+ type ServiceRunConfig struct {
+ 	ServiceConfig
+@@ -114,6 +153,18 @@ func AddServiceConfigFlags(cmd *cobra.Command, cfg *ServiceConfig) {
+ 		false,
+ 		"Skip TLS certificate verification for bootstrap",
+ 	)
++	cmd.Flags().BoolVar(
++		&cfg.BootstrapNoProxy,
++		"bootstrap-no-proxy",
++		false,
++		"Disable HTTP proxy usage for bootstrap requests",
++	)
++	cmd.Flags().BoolVar(
++		&cfg.BootstrapForceIPv4,
++		"bootstrap-force-ipv4",
++		false,
++		"Force IPv4 for bootstrap requests (useful on networks with broken IPv6)",
++	)
+ 
+ 	// Convenience flags
+ 	cmd.Flags().BoolVar(&cfg.LocalMode, "local", false, "Run in local mode (no control plane connection)")
+diff --git a/edge/cmd/flags/service_test.go b/edge/cmd/flags/service_test.go
+index 38daf1ef..37e2e8ba 100644
+--- a/edge/cmd/flags/service_test.go
++++ b/edge/cmd/flags/service_test.go
+@@ -73,3 +73,135 @@ func TestResolveBootstrapInsecure(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestResolveBootstrapNoProxy(t *testing.T) {
++	tests := []struct {
++		name     string
++		cliValue bool
++		envValue string
++		expected bool
++	}{
++		{
++			name:     "CLI true overrides everything",
++			cliValue: true,
++			envValue: "",
++			expected: true,
++		},
++		{
++			name:     "CLI true overrides env false",
++			cliValue: true,
++			envValue: "false",
++			expected: true,
++		},
++		{
++			name:     "CLI false, env true returns true",
++			cliValue: false,
++			envValue: "true",
++			expected: true,
++		},
++		{
++			name:     "CLI false, env 1 returns true",
++			cliValue: false,
++			envValue: "1",
++			expected: true,
++		},
++		{
++			name:     "CLI false, env false returns false",
++			cliValue: false,
++			envValue: "false",
++			expected: false,
++		},
++		{
++			name:     "CLI false, env empty returns false",
++			cliValue: false,
++			envValue: "",
++			expected: false,
++		},
++		{
++			name:     "CLI false, env random string returns false",
++			cliValue: false,
++			envValue: "yes",
++			expected: false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if tt.envValue != "" {
++				os.Setenv(EnvBootstrapNoProxy, tt.envValue)
++				defer os.Unsetenv(EnvBootstrapNoProxy)
++			} else {
++				os.Unsetenv(EnvBootstrapNoProxy)
++			}
++
++			result := ResolveBootstrapNoProxy(tt.cliValue)
++			assert.Equal(t, tt.expected, result)
++		})
++	}
++}
++
++func TestResolveBootstrapForceIPv4(t *testing.T) {
++	tests := []struct {
++		name     string
++		cliValue bool
++		envValue string
++		expected bool
++	}{
++		{
++			name:     "CLI true overrides everything",
++			cliValue: true,
++			envValue: "",
++			expected: true,
++		},
++		{
++			name:     "CLI true overrides env false",
++			cliValue: true,
++			envValue: "false",
++			expected: true,
++		},
++		{
++			name:     "CLI false, env true returns true",
++			cliValue: false,
++			envValue: "true",
++			expected: true,
++		},
++		{
++			name:     "CLI false, env 1 returns true",
++			cliValue: false,
++			envValue: "1",
++			expected: true,
++		},
++		{
++			name:     "CLI false, env false returns false",
++			cliValue: false,
++			envValue: "false",
++			expected: false,
++		},
++		{
++			name:     "CLI false, env empty returns false",
++			cliValue: false,
++			envValue: "",
++			expected: false,
++		},
++		{
++			name:     "CLI false, env random string returns false",
++			cliValue: false,
++			envValue: "yes",
++			expected: false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if tt.envValue != "" {
++				os.Setenv(EnvBootstrapForceIPv4, tt.envValue)
++				defer os.Unsetenv(EnvBootstrapForceIPv4)
++			} else {
++				os.Unsetenv(EnvBootstrapForceIPv4)
++			}
++
++			result := ResolveBootstrapForceIPv4(tt.cliValue)
++			assert.Equal(t, tt.expected, result)
++		})
++	}
++}
+diff --git a/shared/bootstrap/client.go b/shared/bootstrap/client.go
+index 4784a0d3..81d8c3b1 100644
+--- a/shared/bootstrap/client.go
++++ b/shared/bootstrap/client.go
+@@ -52,6 +52,12 @@ type ClientConfig struct {
+ 
+ 	// InsecureSkipVerify skips TLS certificate verification
+ 	InsecureSkipVerify bool
++
++	// DisableProxy disables proxy usage for bootstrap requests
++	DisableProxy bool
++
++	// ForceIPv4 forces IPv4 for bootstrap requests
++	ForceIPv4 bool
+ }
+ 
+ // NewClient creates a new bootstrap client
+@@ -75,6 +81,8 @@ func NewClient(config ClientConfig) (*Client, error) {
+ 		Timeout:            config.Timeout,
+ 		Debug:              config.Debug,
+ 		InsecureSkipVerify: config.InsecureSkipVerify,
++		DisableProxy:       config.DisableProxy,
++		ForceIPv4:          config.ForceIPv4,
+ 		Auth: corehttp.AuthConfig{
+ 			Token: config.Token,
+ 		},
+diff --git a/shared/bootstrap/service.go b/shared/bootstrap/service.go
+index 295fa5e2..c07d3102 100644
+--- a/shared/bootstrap/service.go
++++ b/shared/bootstrap/service.go
+@@ -93,7 +93,7 @@ func (s *BootstrapService) Bootstrap(ctx context.Context, opts BootstrapOptions)
+ 
+ 	// Perform bootstrap with provided token
+ 	s.logger.Debug("Attempting bootstrap with provided token")
+-	return s.doBootstrap(ctx, opts.Token, opts.URL, opts.Insecure, "bootstrap")
++	return s.doBootstrap(ctx, opts.Token, opts.URL, opts.Insecure, opts.DisableProxy, opts.ForceIPv4, "bootstrap")
+ }
+ 
+ // Refresh refreshes existing credentials using the saved JWT
+@@ -107,7 +107,7 @@ func (s *BootstrapService) Refresh(ctx context.Context, insecure bool) (*Credent
+ 	}
+ 
+ 	s.logger.Debug("Attempting refresh with existing JWT")
+-	return s.doBootstrap(ctx, info.UserJWT, info.ConnectionConfig.RefreshAddress, insecure, "refresh")
++	return s.doBootstrap(ctx, info.UserJWT, info.ConnectionConfig.RefreshAddress, insecure, false, false, "refresh")
+ }
+ 
+ // EnsureBootstrapped checks if bootstrap is needed and performs it if necessary
+@@ -145,10 +145,12 @@ func (s *BootstrapService) EnsureBootstrapped(ctx context.Context, opts Bootstra
+ 	}
+ 
+ 	_, err := s.Bootstrap(ctx, BootstrapOptions{
+-		Token:    opts.Token,
+-		URL:      opts.URL,
+-		Force:    false,
+-		Insecure: opts.Insecure,
++		Token:        opts.Token,
++		URL:          opts.URL,
++		Force:        false,
++		Insecure:     opts.Insecure,
++		DisableProxy: opts.DisableProxy,
++		ForceIPv4:    opts.ForceIPv4,
+ 	})
+ 	if err != nil {
+ 		// Handle already bootstrapped case gracefully
+@@ -171,6 +173,8 @@ func (s *BootstrapService) doBootstrap(
+ 	token,
+ 	bootstrapURL string,
+ 	insecure bool,
++	disableProxy bool,
++	forceIPv4 bool,
+ 	operation string,
+ ) (*CredentialInfo, error) {
+ 	// Use default URL if none provided
+@@ -183,6 +187,8 @@ func (s *BootstrapService) doBootstrap(
+ 		BaseURL:            bootstrapURL,
+ 		Token:              token,
+ 		InsecureSkipVerify: insecure,
++		DisableProxy:       disableProxy,
++		ForceIPv4:          forceIPv4,
+ 	})
+ 	if err != nil {
+ 		return nil, errors.Wrap(err, "failed to create bootstrap client")
+diff --git a/shared/bootstrap/types.go b/shared/bootstrap/types.go
+index 3cee47fd..80334876 100644
+--- a/shared/bootstrap/types.go
++++ b/shared/bootstrap/types.go
+@@ -30,6 +30,12 @@ type BootstrapOptions struct {
+ 	Force bool
+ 	// Insecure skips TLS certificate verification
+ 	Insecure bool
++
++	// DisableProxy disables proxy usage for bootstrap requests
++	DisableProxy bool
++
++	// ForceIPv4 forces IPv4 for bootstrap requests
++	ForceIPv4 bool
+ }
+ 
+ // BootstrapResponse is returned by the bootstrap service
+diff --git a/shared/http/client.go b/shared/http/client.go
+index a4454952..8484abba 100644
+--- a/shared/http/client.go
++++ b/shared/http/client.go
+@@ -1,7 +1,9 @@
+ package http
+ 
+ import (
++	"context"
+ 	"crypto/tls"
++	"net"
+ 	"time"
+ 
+ 	"github.com/expanso-io/expanso/shared/version"
+@@ -52,6 +54,19 @@ func NewClient(config Config) (*req.Client, error) {
+ 			})
+ 	}
+ 
++	// Disable proxy usage if requested
++	if config.DisableProxy {
++		client.SetProxy(nil)
++	}
++
++	// Force IPv4 connections if requested
++	if config.ForceIPv4 {
++		client.SetDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
++			dialer := net.Dialer{Timeout: config.Timeout}
++			return dialer.DialContext(ctx, "tcp4", addr)
++		})
++	}
++
+ 	// Configure debug mode
+ 	if config.Debug {
+ 		client.EnableDebugLog()
+diff --git a/shared/http/config.go b/shared/http/config.go
+index 00c75192..fe749605 100644
+--- a/shared/http/config.go
++++ b/shared/http/config.go
+@@ -28,6 +28,12 @@ type Config struct {
+ 	// Debug enables debug logging and request/response dumping (default: false)
+ 	Debug bool
+ 
++	// DisableProxy disables HTTP proxy usage, ignoring HTTP_PROXY/HTTPS_PROXY/NO_PROXY
++	DisableProxy bool
++
++	// ForceIPv4 forces IPv4 for TCP connections (useful on networks with broken IPv6)
++	ForceIPv4 bool
++
+ 	// Auth configuration
+ 	Auth AuthConfig
+ }
+diff --git a/shared/http/errors.go b/shared/http/errors.go
+index d0b8b607..e05ac2a7 100644
+--- a/shared/http/errors.go
++++ b/shared/http/errors.go
+@@ -108,6 +108,8 @@ func createHTTPStatusError(resp *req.Response) *errors.Error {
+ 
+ // handleNetworkError categorizes network errors more precisely
+ func handleNetworkError(err error, reqURL string) *errors.Error {
++	rootErr := err.Error()
++
+ 	// Parse URL to get host and port for better error messages
+ 	parsedURL, _ := url.Parse(reqURL)
+ 	host := parsedURL.Host
+@@ -127,10 +129,15 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
+ 		// Check the underlying error
+ 		errStr := urlErr.Err.Error()
+ 		switch {
++		case strings.Contains(errStr, "proxyconnect"):
++			return withRootCause(errors.Newf("proxy connection failed while reaching %s", host).
++				WithCode(errors.CodeServiceUnavailable).
++				WithHint("Check HTTP_PROXY/HTTPS_PROXY/NO_PROXY environment variables and proxy availability").
++				WithDetail("proxy_error", errStr), rootErr)
+ 		case strings.Contains(errStr, "no such host"):
+-			return errors.Newf("unable to resolve host '%s'", parsedURL.Hostname()).
++			return withRootCause(errors.Newf("unable to resolve host '%s'", parsedURL.Hostname()).
+ 				WithCode(errors.CodeBadRequest).
+-				WithHint("Check if the hostname is spelled correctly and that DNS is working")
++				WithHint("Check if the hostname is spelled correctly and that DNS is working"), rootErr)
+ 		case strings.Contains(errStr, "connection refused"):
+ 			hint := fmt.Sprintf(`The server at %s refused the connection. To resolve this:
+ 1. Ensure the server is running
+@@ -138,9 +145,9 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
+ 3. Verify firewall settings allow the connection
+ 4. If using localhost, ensure the service is bound to the correct interface`, host)
+ 
+-			return errors.Newf("connection refused by server at %s", host).
++			return withRootCause(errors.Newf("connection refused by server at %s", host).
+ 				WithCode(errors.CodeServiceUnavailable).
+-				WithHint(hint)
++				WithHint(hint), rootErr)
+ 		}
+ 	}
+ 
+@@ -148,17 +155,17 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
+ 	var netErr net.Error
+ 	if stderrors.As(err, &netErr) {
+ 		if netErr.Timeout() {
+-			return errors.Newf("network operation timed out while connecting to %s", host).
++			return withRootCause(errors.Newf("network operation timed out while connecting to %s", host).
+ 				WithCode(errors.CodeTimeout).
+-				WithHint("This might be due to network issues or an unresponsive server")
++				WithHint("This might be due to network issues or an unresponsive server"), rootErr)
+ 		}
+ 
+ 		// Check for specific network operation errors
+ 		if opErr, ok := netErr.(*net.OpError); ok {
+ 			if opErr.Op == "dial" {
+-				return errors.Newf("failed to establish connection to %s", host).
++				return withRootCause(errors.Newf("failed to establish connection to %s", host).
+ 					WithCode(errors.CodeServiceUnavailable).
+-					WithHint("The server might be down or unreachable. Check network connectivity and server status")
++					WithHint("The server might be down or unreachable. Check network connectivity and server status"), rootErr)
+ 			}
+ 		}
+ 	}
+@@ -167,26 +174,33 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
+ 	errStr := err.Error()
+ 	switch {
+ 	case strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline exceeded"):
+-		return errors.Newf("request to %s timed out", host).
++		return withRootCause(errors.Newf("request to %s timed out", host).
+ 			WithCode(errors.CodeTimeout).
+-			WithHint("The operation took too long. Consider increasing the timeout or checking server performance")
++			WithHint("The operation took too long. Consider increasing the timeout or checking server performance"), rootErr)
+ 	case strings.Contains(errStr, "connection reset"):
+-		return errors.Newf("connection to %s was reset by the server", host).
++		return withRootCause(errors.Newf("connection to %s was reset by the server", host).
+ 			WithCode(errors.CodeServiceUnavailable).
+-			WithHint("The server closed the connection unexpectedly. This might indicate a server issue or network problem")
++			WithHint("The server closed the connection unexpectedly. This might indicate a server issue or network problem"), rootErr)
+ 	case strings.Contains(errStr, "broken pipe"):
+-		return errors.Newf("connection to %s was broken during data transfer", host).
++		return withRootCause(errors.Newf("connection to %s was broken during data transfer", host).
+ 			WithCode(errors.CodeNetworkError).
+-			WithHint("The connection was interrupted. " +
+-				"This often happens when the server closes the connection while data is being sent")
++			WithHint("The connection was interrupted. "+
++				"This often happens when the server closes the connection while data is being sent"), rootErr)
+ 	case strings.Contains(errStr, "certificate") || strings.Contains(errStr, "x509"):
+-		return errors.Newf("TLS certificate validation failed for %s", host).
++		return withRootCause(errors.Newf("TLS certificate validation failed for %s", host).
+ 			WithCode(errors.CodeBadRequest).
+-			WithHint("The server's certificate is invalid or untrusted. Verify the certificate or use proper CA certificates")
++			WithHint("The server's certificate is invalid or untrusted. Verify the certificate or use proper CA certificates"), rootErr)
+ 	default:
+ 		// Generic network error
+-		return errors.Newf("network error occurred while connecting to %s: %v", host, err).
++		return withRootCause(errors.Newf("network error occurred while connecting to %s: %v", host, err).
+ 			WithCode(errors.CodeNetworkError).
+-			WithHint("Check your network connection and try again")
++			WithHint("Check your network connection and try again"), rootErr)
++	}
++}
++
++func withRootCause(err *errors.Error, root string) *errors.Error {
++	if root != "" {
++		err = err.WithDetail("root_error", root)
+ 	}
++	return err
+ }
+diff --git a/shared/http/errors_test.go b/shared/http/errors_test.go
+index d58a04c6..1d75d76b 100644
+--- a/shared/http/errors_test.go
++++ b/shared/http/errors_test.go
+@@ -87,6 +87,7 @@ func TestTransformError_NetworkError(t *testing.T) {
+ 	assert.Equal(t, "HTTPClient", err.Component)
+ 	assert.Equal(t, "http://invalid-domain-that-does-not-exist-12345.com", err.Details["url"])
+ 	assert.Equal(t, "GET", err.Details["method"])
++	assert.NotEmpty(t, err.Details["root_error"])
+ 	assert.Contains(t, err.Message, "unable to resolve host")
+ 	assert.Contains(t, err.Hint, "Check if the hostname is spelled correctly")
+ }
+@@ -160,6 +161,7 @@ func TestTransformError_ConnectionRefused(t *testing.T) {
+ 	require.NotNil(t, err)
+ 	assert.Equal(t, errors.CodeServiceUnavailable, err.Code)
+ 	assert.Equal(t, "HTTPClient", err.Component)
++	assert.NotEmpty(t, err.Details["root_error"])
+ 	assert.Contains(t, err.Message, "connection refused")
+ 	assert.Contains(t, err.Hint, "Ensure the server is running")
+ }
