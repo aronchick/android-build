@@ -1,0 +1,13 @@
+diff --git a/edge/internal/node/info_provider.go b/edge/internal/node/info_provider.go
+index f3b94a65..f33e027e 100644
+--- a/edge/internal/node/info_provider.go
++++ b/edge/internal/node/info_provider.go
+@@ -74,7 +74,7 @@ func hostname() string {
+ //	on VMs created from the same image
+ func machineID() string {
+ 	id, err := machineid.ID()
+-	if err != nil {
++	if err != nil || id == "" {
+ 		return "unknown"
+ 	}
+ 	return id
