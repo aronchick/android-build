@@ -1,5 +1,5 @@
 diff --git a/edge/cmd/expanso-edge/main.go b/edge/cmd/expanso-edge/main.go
-index f1bb1cdb..ef0f6ab8 100644
+index f1bb1cdb..77a5db90 100644
 --- a/edge/cmd/expanso-edge/main.go
 +++ b/edge/cmd/expanso-edge/main.go
 @@ -4,6 +4,7 @@ import (
@@ -10,7 +10,7 @@ index f1bb1cdb..ef0f6ab8 100644
  	"syscall"
  
  	"github.com/expanso-io/expanso/edge/cmd/commands"
-@@ -28,6 +29,20 @@ func main() {
+@@ -28,6 +29,21 @@ func main() {
  	// Create and execute root command with signal context
  	rootCmd := commands.NewRootCommand()
  	rootCmd.SetContext(ctx)
@@ -23,7 +23,8 @@ index f1bb1cdb..ef0f6ab8 100644
 +		if exe != "" {
 +			baseExe = filepath.Base(exe)
 +		}
-+		if args[0] == os.Args[0] || args[0] == baseArg0 || (exe != "" && (args[0] == exe || args[0] == baseExe)) {
++		baseArg1 := filepath.Base(args[0])
++		if args[0] == os.Args[0] || baseArg1 == baseArg0 || (exe != "" && (args[0] == exe || (baseExe != "" && baseArg1 == baseExe))) {
 +			args = args[1:]
 +		}
 +	}
