@@ -85,22 +85,22 @@ else
   json="$(curl -fsSL "$release_api")"
 fi
 asset_name="${BINARY_NAME}-android-${arch}"
-if command -v jq >/dev/null 2>&1; then
-  asset_url="$(printf '%s' "$json" | jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' | head -n 1)"
-else
-  # Best-effort JSON parse without jq (line-based on GitHub's pretty JSON).
-  asset_url="$(printf '%s\n' "$json" | awk -v name="$asset_name" '
-    $0 ~ "\"name\"[[:space:]]*:[[:space:]]*\""name"\"" { found=1 }
-    found && $0 ~ "\"browser_download_url\"[[:space:]]*:" {
-      gsub(/.*\"browser_download_url\"[[:space:]]*:[[:space:]]*\"/, "");
-      gsub(/\".*/, "");
-      print;
-      exit
-    }
-  ')"
-fi
+# Best-effort JSON parse without extra tools (line-based on GitHub's pretty JSON).
+asset_url="$(printf '%s\n' "$json" | awk -v name="$asset_name" '
+  $0 ~ "\"name\"[[:space:]]*:[[:space:]]*\""name"\"" { found=1 }
+  found && $0 ~ "\"browser_download_url\"[[:space:]]*:" {
+    gsub(/.*\"browser_download_url\"[[:space:]]*:[[:space:]]*\"/, "");
+    gsub(/\".*/, "");
+    print;
+    exit
+  }
+')"
 
 if [ -z "$asset_url" ]; then
+  message="$(printf '%s\n' "$json" | awk -F'\"' '/\"message\"[[:space:]]*:/ { print $4; exit }')"
+  if [ -n "$message" ]; then
+    echo "GitHub API error: $message" >&2
+  fi
   echo "Error: release asset not found for ${asset_name} (version: ${VERSION})." >&2
   exit 1
 fi
