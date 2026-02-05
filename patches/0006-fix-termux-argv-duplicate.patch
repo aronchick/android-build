@@ -1,8 +1,8 @@
 diff --git a/edge/cmd/expanso-edge/main.go b/edge/cmd/expanso-edge/main.go
-index 0b7f0f1b..1d92d5b0 100644
+index f1bb1cdb..ef0f6ab8 100644
 --- a/edge/cmd/expanso-edge/main.go
 +++ b/edge/cmd/expanso-edge/main.go
-@@ -4,8 +4,9 @@ import (
+@@ -4,6 +4,7 @@ import (
  	"context"
  	"os"
  	"os/signal"
@@ -10,7 +10,7 @@ index 0b7f0f1b..1d92d5b0 100644
  	"syscall"
  
  	"github.com/expanso-io/expanso/edge/cmd/commands"
-@@ -28,6 +29,23 @@ func main() {
+@@ -28,6 +29,20 @@ func main() {
  	// Create and execute root command with signal context
  	rootCmd := commands.NewRootCommand()
  	rootCmd.SetContext(ctx)
@@ -31,5 +31,3 @@ index 0b7f0f1b..1d92d5b0 100644
  	if err := rootCmd.Execute(); err != nil {
  		// Use clifatal to handle error presentation and exit
  		clifatal.Fatal(rootCmd, err)
- 	}
- }
