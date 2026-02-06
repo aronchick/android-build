@@ -130,8 +130,18 @@ resolve_toolchain_bin() {
       exit 1
       ;;
   esac
+  local prebuilt_root="$ndk_home/toolchains/llvm/prebuilt"
+  if [[ ! -d "$prebuilt_root/$host_tag" ]]; then
+    if [[ "$host_os" == "darwin" && -d "$prebuilt_root/darwin-x86_64" ]]; then
+      echo "Warning: falling back to darwin-x86_64 NDK toolchain." >&2
+      host_tag="darwin-x86_64"
+    elif [[ "$host_os" == "linux" && -d "$prebuilt_root/linux-x86_64" ]]; then
+      echo "Warning: falling back to linux-x86_64 NDK toolchain." >&2
+      host_tag="linux-x86_64"
+    fi
+  fi
 
-  echo "$ndk_home/toolchains/llvm/prebuilt/$host_tag/bin"
+  echo "$prebuilt_root/$host_tag/bin"
 }
 
 ensure_submodule
