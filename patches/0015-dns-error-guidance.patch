@@ -1,0 +1,60 @@
+From f8c25c9d44e2dbbc09181e63e23aba9194a675db Mon Sep 17 00:00:00 2001
+From: David Aronchick <aronchick@gmail.com>
+Date: Fri, 6 Feb 2026 10:04:11 -0800
+Subject: [PATCH] fix: add dns override guidance to http errors
+
+---
+ shared/http/errors.go      | 11 +++++++----
+ shared/http/errors_test.go |  3 ++-
+ 2 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/shared/http/errors.go b/shared/http/errors.go
+index 9a22f95..2e2ec64 100644
+--- a/shared/http/errors.go
++++ b/shared/http/errors.go
+@@ -176,11 +176,12 @@ func handleDNSError(err error, h hostDetails, rootErr string) *errors.Error {
+ 		return nil
+ 	}
+ 
+-	hint := "DNS lookup failed. Check if the hostname is spelled correctly and that DNS is working."
++	dnsOverrideHint := "If DNS is blocked or misconfigured, set dns.servers in your config (e.g., dns: { servers: [\"8.8.8.8\"] }) or set EXPANSO_EDGE_DNS_SERVERS=\"8.8.8.8\"."
++	hint := "DNS lookup failed. " + dnsOverrideHint
+ 	if dnsErr.IsTimeout {
+-		hint = "DNS lookup timed out. Check network connectivity or try a different DNS resolver."
++		hint = "DNS lookup timed out. " + dnsOverrideHint
+ 	} else if dnsErr.IsTemporary {
+-		hint = "DNS lookup is temporarily failing. Retry or switch networks."
++		hint = "DNS lookup is temporarily failing. Retry or switch networks. " + dnsOverrideHint
+ 	}
+ 	dnsMsg := dnsErr.Name
+ 	if dnsMsg == "" {
+@@ -295,9 +296,11 @@ func handleErrorStringPatterns(err error, h hostDetails, parsedURL *url.URL, roo
+ 		if hostname == "" {
+ 			hostname = h.hostname
+ 		}
++		hint := "DNS lookup failed. Check that the hostname is correct. " +
++			"If DNS is blocked or misconfigured, set dns.servers in your config (e.g., dns: { servers: [\"8.8.8.8\"] }) or set EXPANSO_EDGE_DNS_SERVERS=\"8.8.8.8\"."
+ 		e := h.add(errors.Newf("unable to resolve host '%s'", hostname).
+ 			WithCode(errors.CodeBadRequest).
+-			WithHint("Check if the hostname is spelled correctly and that DNS is working"))
++			WithHint(hint))
+ 		return withRootCause(e, rootErr)
+ 	case strings.Contains(errStr, "connection refused"):
+ 		e := h.add(errors.Newf("connection refused by server at %s", h.host).
+diff --git a/shared/http/errors_test.go b/shared/http/errors_test.go
+index 1d75d76..d4d5e48 100644
+--- a/shared/http/errors_test.go
++++ b/shared/http/errors_test.go
+@@ -89,7 +89,8 @@ func TestTransformError_NetworkError(t *testing.T) {
+ 	assert.Equal(t, "GET", err.Details["method"])
+ 	assert.NotEmpty(t, err.Details["root_error"])
+ 	assert.Contains(t, err.Message, "unable to resolve host")
+-	assert.Contains(t, err.Hint, "Check if the hostname is spelled correctly")
++	assert.Contains(t, err.Hint, "dns.servers")
++	assert.Contains(t, err.Hint, "EXPANSO_EDGE_DNS_SERVERS")
+ }
+ 
+ func TestTransformError_ContextCancelled(t *testing.T) {
+-- 
+2.52.0
+
