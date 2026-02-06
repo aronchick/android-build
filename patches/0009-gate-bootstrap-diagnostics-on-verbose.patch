@@ -71,137 +71,39 @@ index 802c32b..0ee9201 100644
  	if err != nil {
  		return errors.Wrap(err, "failed to connect edge node")
 diff --git a/shared/bootstrap/client.go b/shared/bootstrap/client.go
-index 81d8c3b..2eab5ca 100644
+index d6c2fc6..2eab5ca 100644
 --- a/shared/bootstrap/client.go
 +++ b/shared/bootstrap/client.go
-@@ -2,7 +2,10 @@ package bootstrap
- 
- import (
- 	"context"
-+	stderrors "errors"
- 	"fmt"
-+	"net/http"
-+	"strings"
- 	"time"
- 
- 	"github.com/expanso-io/expanso/lib/errors"
-@@ -34,6 +37,8 @@ func getContextDeadline(ctx context.Context) string {
- // Client handles communication with the bootstrap service
- type Client struct {
- 	http *req.Client
-+	base string
-+	diag diagnosticsConfig
- }
- 
- // ClientConfig contains configuration for the bootstrap client
-@@ -96,6 +101,14 @@ func NewClient(config ClientConfig) (*Client, error) {
- 
- 	return &Client{
+@@ -103,6 +103,7 @@ func NewClient(config ClientConfig) (*Client, error) {
  		http: httpClient,
-+		base: config.BaseURL,
-+		diag: diagnosticsConfig{
+ 		base: config.BaseURL,
+ 		diag: diagnosticsConfig{
 +			enabled:            config.Debug,
-+			disableProxy:       config.DisableProxy,
-+			forceIPv4:          config.ForceIPv4,
-+			insecureSkipVerify: config.InsecureSkipVerify,
-+			timeout:            config.Timeout,
-+		},
- 	}, nil
- }
- 
-@@ -110,6 +123,9 @@ func (c *Client) Bootstrap(ctx context.Context, req *BootstrapRequest) (*Bootstr
- 		Post("/api/v1/register")
- 
- 	if err != nil {
-+		if enhanced := c.enhanceBootstrapError(ctx, err); enhanced != nil {
-+			return nil, enhanced
-+		}
- 		return nil, fmt.Errorf("bootstrap request failed: %w", err)
+ 			disableProxy:       config.DisableProxy,
+ 			forceIPv4:          config.ForceIPv4,
+ 			insecureSkipVerify: config.InsecureSkipVerify,
+@@ -155,6 +156,9 @@ func (c *Client) enhanceBootstrapError(ctx context.Context, err error) error {
+ 	if !stderrors.As(err, &structuredErr) {
+ 		return nil
  	}
- 	// Validate response
-@@ -134,3 +150,82 @@ func (c *Client) Bootstrap(ctx context.Context, req *BootstrapRequest) (*Bootstr
- 
- 	return &response, nil
- }
-+
-+func (c *Client) enhanceBootstrapError(ctx context.Context, err error) error {
-+	var structuredErr *errors.Error
-+	if !stderrors.As(err, &structuredErr) {
-+		return nil
-+	}
 +	if !c.diag.enabled {
 +		return nil
 +	}
-+
-+	switch structuredErr.HTTPStatus {
-+	case http.StatusUnauthorized:
-+		return structuredErr.Copy().WithHint(
-+			"Bootstrap token is invalid or expired. " +
-+				"Generate a new token in https://cloud.expanso.io and try again.",
-+		)
-+	case http.StatusForbidden:
-+		return structuredErr.Copy().WithHint(
-+			"Bootstrap token is not authorized for this workspace. " +
-+				"Generate a new token in https://cloud.expanso.io and try again.",
-+		)
-+	}
-+
-+	if isNetworkBootstrapError(structuredErr) {
-+		enhanced := structuredErr.Copy()
-+		if structuredErr.Code == errors.CodeServiceUnavailable &&
-+			strings.Contains(strings.ToLower(structuredErr.Message), "connection refused") {
-+			hint := enhanced.Hint
-+			if hint != "" {
-+				hint += "\n\n"
-+			}
-+			hint += "If this endpoint is known to be up, check local network/proxy settings and try forcing IPv4 if supported. " +
-+				"For diagnostics, run: curl -4 -v <bootstrap_url>/api/v1/register with the same token."
-+			enhanced = enhanced.WithHint(hint)
-+		}
-+
-+		diagCtx := ctx
-+		if diagCtx == nil || diagCtx.Err() != nil {
-+			diagCtx = context.Background()
-+		}
-+		diagnostics := runBootstrapDiagnostics(diagCtx, c.base, c.diag)
-+		return appendDiagnostics(enhanced, diagnostics)
-+	}
-+
-+	return structuredErr
-+}
-+
-+func isNetworkBootstrapError(err *errors.Error) bool {
-+	if err == nil {
-+		return false
-+	}
-+	if err.Code == errors.CodeRequestCancelled {
-+		return false
-+	}
-+	if err.Details == nil {
-+		return false
-+	}
-+	return err.Details["root_error"] != ""
-+}
-+
-+func appendDiagnostics(err *errors.Error, diagnostics diagnosticResult) *errors.Error {
-+	if err == nil || len(diagnostics.lines) == 0 {
-+		return err
-+	}
-+
-+	hint := diagnostics.hint()
-+	if hint != "" {
-+		if err.Hint != "" {
-+			hint = err.Hint + "\n\n" + hint
-+		}
-+		err = err.WithHint(hint)
-+	}
-+
-+	for key, value := range diagnostics.details {
-+		err = err.WithDetail(key, value)
-+	}
-+
-+	return err
-+}
+ 
+ 	switch structuredErr.HTTPStatus {
+ 	case http.StatusUnauthorized:
+diff --git a/shared/bootstrap/diagnostics.go b/shared/bootstrap/diagnostics.go
+index 3337026..1533256 100644
+--- a/shared/bootstrap/diagnostics.go
++++ b/shared/bootstrap/diagnostics.go
+@@ -16,6 +16,7 @@ import (
+ )
+ 
+ type diagnosticsConfig struct {
++	enabled            bool
+ 	disableProxy       bool
+ 	forceIPv4          bool
+ 	insecureSkipVerify bool
 diff --git a/shared/bootstrap/service.go b/shared/bootstrap/service.go
 index a88b799..a505029 100644
 --- a/shared/bootstrap/service.go
