@@ -1,0 +1,553 @@
+From bfe334d92361d774083ae87183edb50719bb1591 Mon Sep 17 00:00:00 2001
+From: David Aronchick <aronchick@gmail.com>
+Date: Fri, 6 Feb 2026 09:09:49 -0800
+Subject: [PATCH] feat: add global DNS override
+
+---
+ edge/cmd/commands/bootstrap.go          |   5 ++
+ edge/cmd/commands/run.go                |  20 +++--
+ shared/telemetry/dns_override.go        | 107 ++++++++++++++++++++++++
+ shared/telemetry/provider.go            |  16 +++-
+ shared/transport/ncltransport/client.go |   2 +-
+ types/config_edge.go                    |  98 ++++++++++++++++++++--
+ types/dns.go                            |  92 ++++++++++++++++++++
+ types/telemetry.go                      |   5 +-
+ 8 files changed, 326 insertions(+), 19 deletions(-)
+ create mode 100644 types/dns.go
+
+diff --git a/edge/cmd/commands/bootstrap.go b/edge/cmd/commands/bootstrap.go
+index e94f894..2cf38b8 100644
+--- a/edge/cmd/commands/bootstrap.go
++++ b/edge/cmd/commands/bootstrap.go
+@@ -145,6 +145,11 @@ func runBootstrap(cmd *cobra.Command, cfg *bootstrapConfig) error {
+ 	forceIPv4 := flags.ResolveBootstrapForceIPv4(cfg.ForceIPv4)
+ 	dnsServers := flags.ResolveBootstrapDNSServers(cfg.DNSServers)
+ 	resolvConf := flags.ResolveBootstrapResolvConf(cfg.ResolvConf)
++	if len(dnsServers) == 0 && resolvConf == "" {
++		dns := currentCfg.GetDNSConfig()
++		dnsServers = dns.Servers
++		resolvConf = dns.ResolvConf
++	}
+ 	_, err = bootstrapService.Bootstrap(ctx, bootstrap.BootstrapOptions{
+ 		Token:        token,
+ 		URL:          url,
+diff --git a/edge/cmd/commands/run.go b/edge/cmd/commands/run.go
+index 9a99a89..afc8664 100644
+--- a/edge/cmd/commands/run.go
++++ b/edge/cmd/commands/run.go
+@@ -115,13 +115,14 @@ func runServiceDirectly(cmd *cobra.Command, cfg *flags.ServiceRunConfig) error {
+ 	// Initialize unified telemetry infrastructure
+ 	// This must be done before creating any services
+ 	edgeCfg := configManager.Current()
+-	if err = telemetry.Initialize(ctx, &edgeCfg.Telemetry, "expanso-edge", edgeCfg.GetNodeID()); err != nil {
++	telemetryCfg := edgeCfg.GetTelemetryConfig()
++	if err = telemetry.Initialize(ctx, telemetryCfg, "expanso-edge", edgeCfg.GetNodeID()); err != nil {
+ 		return fmt.Errorf("failed to initialize telemetry: %w", err)
+ 	}
+ 	defer func() {
+ 		// Shutdown telemetry after all services have stopped
+ 		// Use a short timeout to avoid blocking shutdown when collector is unavailable
+-		shutdownCtx, cancel := context.WithTimeout(context.Background(), edgeCfg.Telemetry.GetShutdownTimeout())
++		shutdownCtx, cancel := context.WithTimeout(context.Background(), telemetryCfg.GetShutdownTimeout())
+ 		defer cancel()
+ 		if err = telemetry.Shutdown(shutdownCtx); err != nil {
+ 			slog.Error("Failed to shutdown telemetry", "error", err)
+@@ -188,13 +189,14 @@ func runWithSupervisor(cmd *cobra.Command, cfg *flags.ServiceRunConfig) error {
+ 	// Initialize unified telemetry infrastructure
+ 	// This must be done before creating any services
+ 	edgeCfg := configManager.Current()
+-	if err := telemetry.Initialize(ctx, &edgeCfg.Telemetry, "expanso-edge", edgeCfg.GetNodeID()); err != nil {
++	telemetryCfg := edgeCfg.GetTelemetryConfig()
++	if err := telemetry.Initialize(ctx, telemetryCfg, "expanso-edge", edgeCfg.GetNodeID()); err != nil {
+ 		return fmt.Errorf("failed to initialize telemetry: %w", err)
+ 	}
+ 	defer func() {
+ 		// Shutdown telemetry after supervisor has stopped
+ 		// Use a short timeout to avoid blocking shutdown when collector is unavailable
+-		shutdownCtx, cancel := context.WithTimeout(context.Background(), edgeCfg.Telemetry.GetShutdownTimeout())
++		shutdownCtx, cancel := context.WithTimeout(context.Background(), telemetryCfg.GetShutdownTimeout())
+ 		defer cancel()
+ 		if err := telemetry.Shutdown(shutdownCtx); err != nil {
+ 			slog.Error("Failed to shutdown telemetry", "error", err)
+@@ -251,11 +253,19 @@ func ensureRegistered(
+ 	verbose bool,
+ 	configManager interfaces.EdgeConfigManager,
+ ) error {
++	edgeCfg := configManager.Current()
++
+ 	// If explicit local mode, skip bootstrap
+-	if configManager.Current().LocalMode {
++	if edgeCfg.LocalMode {
+ 		return nil
+ 	}
+ 
++	if len(dnsServers) == 0 && resolvConf == "" {
++		dns := edgeCfg.GetDNSConfig()
++		dnsServers = dns.Servers
++		resolvConf = dns.ResolvConf
++	}
++
+ 	// Not in local mode - attempt bootstrap
+ 	bootstrapService := bootstrap.NewBootstrapService(configManager, nil)
+ 	_, err := bootstrapService.EnsureBootstrapped(ctx, bootstrap.BootstrapOptions{
+diff --git a/shared/telemetry/dns_override.go b/shared/telemetry/dns_override.go
+index 87e097d..57bace6 100644
+--- a/shared/telemetry/dns_override.go
++++ b/shared/telemetry/dns_override.go
+@@ -5,11 +5,13 @@ import (
+ 	"context"
+ 	"net"
+ 	"net/http"
++	"net/url"
+ 	"os"
+ 	"strings"
+ 
+ 	"github.com/expanso-io/expanso/lib/errors"
+ 	"github.com/expanso-io/expanso/types"
++	"google.golang.org/grpc"
+ 	"log/slog"
+ )
+ 
+@@ -92,6 +94,64 @@ func buildTelemetryHTTPClient(cfg *types.TelemetryConfig, logger *slog.Logger) (
+ 	}, nil
+ }
+ 
++func buildTelemetryGRPCDialOptions(cfg *types.TelemetryConfig, logger *slog.Logger) ([]grpc.DialOption, string, error) {
++	override, err := resolveTelemetryDNSOverride(cfg)
++	if err != nil {
++		return nil, "", err
++	}
++	if len(override.servers) == 0 {
++		return nil, "", nil
++	}
++
++	host, port, err := parseTelemetryEndpoint(cfg.Endpoint)
++	if err != nil {
++		return nil, "", err
++	}
++
++	if logger != nil {
++		logger.Info("Using DNS override for telemetry exporter",
++			"servers", strings.Join(override.servers, ", "),
++			"source", override.source,
++			"protocol", "grpc")
++	}
++
++	baseDialer := net.Dialer{Timeout: cfg.GetExportTimeout()}
++	resolver := &net.Resolver{
++		PreferGo: true,
++		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
++			server := override.servers[0]
++			return baseDialer.DialContext(ctx, telemetryDNSNetwork(network), server)
++		},
++	}
++
++	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
++		targetHost, targetPort := host, port
++		if parsedHost, parsedPort, ok := splitHostPort(addr); ok {
++			targetHost, targetPort = parsedHost, parsedPort
++		}
++		if net.ParseIP(targetHost) != nil {
++			return baseDialer.DialContext(ctx, "tcp", net.JoinHostPort(targetHost, targetPort))
++		}
++
++		ips, err := resolver.LookupIPAddr(ctx, targetHost)
++		if err != nil {
++			return nil, err
++		}
++		if len(ips) == 0 {
++			return nil, errors.Newf("no DNS records found for %s", targetHost).
++				WithCode(errors.CodeNetworkError).
++				WithComponent("telemetry")
++		}
++		return baseDialer.DialContext(ctx, "tcp", net.JoinHostPort(ips[0].IP.String(), targetPort))
++	}
++
++	endpoint := "passthrough:///" + net.JoinHostPort(host, port)
++	return []grpc.DialOption{
++		grpc.WithContextDialer(dialer),
++		grpc.WithAuthority(host),
++	}, endpoint, nil
++}
++
+ func telemetryDNSNetwork(network string) string {
+ 	network = strings.ToLower(network)
+ 	switch {
+@@ -172,3 +232,50 @@ func normalizeTelemetryDNSServerAddr(server string) string {
+ 	}
+ 	return net.JoinHostPort(server, "53")
+ }
++
++func parseTelemetryEndpoint(endpoint string) (string, string, error) {
++	if endpoint == "" {
++		return "", "", errors.New("telemetry endpoint is required").
++			WithCode(errors.CodeConfigurationError).
++			WithComponent("telemetry")
++	}
++	if strings.Contains(endpoint, "://") {
++		parsed, err := url.Parse(endpoint)
++		if err != nil {
++			return "", "", errors.Wrap(err, "invalid telemetry endpoint").
++				WithCode(errors.CodeConfigurationError).
++				WithComponent("telemetry")
++		}
++		if parsed.Hostname() == "" || parsed.Port() == "" {
++			return "", "", errors.New("telemetry endpoint must include host and port").
++				WithCode(errors.CodeConfigurationError).
++				WithComponent("telemetry")
++		}
++		return parsed.Hostname(), parsed.Port(), nil
++	}
++
++	host, port, err := net.SplitHostPort(endpoint)
++	if err != nil {
++		return "", "", errors.New("telemetry endpoint must be in host:port format").
++			WithCode(errors.CodeConfigurationError).
++			WithComponent("telemetry")
++	}
++	return host, port, nil
++}
++
++func splitHostPort(addr string) (string, string, bool) {
++	if addr == "" {
++		return "", "", false
++	}
++	if strings.Contains(addr, "://") {
++		parsed, err := url.Parse(addr)
++		if err == nil && parsed.Hostname() != "" && parsed.Port() != "" {
++			return parsed.Hostname(), parsed.Port(), true
++		}
++	}
++	host, port, err := net.SplitHostPort(addr)
++	if err != nil || host == "" || port == "" {
++		return "", "", false
++	}
++	return host, port, true
++}
+diff --git a/shared/telemetry/provider.go b/shared/telemetry/provider.go
+index f60af6b..8e67d83 100644
+--- a/shared/telemetry/provider.go
++++ b/shared/telemetry/provider.go
+@@ -235,10 +235,6 @@ func (p *Provider) createOTLPReader(ctx context.Context) (sdkmetric.Reader, erro
+ 	endpoint := p.config.GetNormalizedEndpoint()
+ 	endpoint_path := p.config.GetEndpointPath()
+ 	protocol := p.config.GetProtocol()
+-	if (len(p.config.DNSServers) > 0 || p.config.ResolvConf != "") && protocol != "http" {
+-		p.logger.Warn("Telemetry DNS override is only supported for HTTP protocol",
+-			"protocol", protocol)
+-	}
+ 
+ 	switch protocol {
+ 	case "grpc":
+@@ -265,6 +261,14 @@ func (p *Provider) createOTLPReader(ctx context.Context) (sdkmetric.Reader, erro
+ 
+ // createOTLPGRPCExporter creates an OTLP gRPC exporter
+ func (p *Provider) createOTLPGRPCExporter(ctx context.Context, endpoint string) (sdkmetric.Exporter, error) {
++	dialOptions, overrideEndpoint, err := buildTelemetryGRPCDialOptions(p.config, p.logger)
++	if err != nil {
++		return nil, err
++	}
++	if overrideEndpoint != "" {
++		endpoint = overrideEndpoint
++	}
++
+ 	opts := []otlpmetricgrpc.Option{
+ 		otlpmetricgrpc.WithEndpoint(endpoint),
+ 		otlpmetricgrpc.WithTimeout(p.config.GetExportTimeout()),
+@@ -280,6 +284,10 @@ func (p *Provider) createOTLPGRPCExporter(ctx context.Context, endpoint string)
+ 		opts = append(opts, otlpmetricgrpc.WithTLSCredentials(insecure.NewCredentials()))
+ 	}
+ 
++	if len(dialOptions) > 0 {
++		opts = append(opts, otlpmetricgrpc.WithDialOption(dialOptions...))
++	}
++
+ 	return otlpmetricgrpc.New(ctx, opts...)
+ }
+ 
+diff --git a/shared/transport/ncltransport/client.go b/shared/transport/ncltransport/client.go
+index f81464a..ecc218f 100644
+--- a/shared/transport/ncltransport/client.go
++++ b/shared/transport/ncltransport/client.go
+@@ -256,7 +256,7 @@ func classifyNATSDNSError(err error, config ClientConfig, dnsServers []string, r
+ 		return nil
+ 	}
+ 
+-	hint := "DNS lookup failed. Check network DNS or configure overrides via orchestrator.dns_servers / orchestrator.resolv_conf (EXPANSO_EDGE_ORCHESTRATOR_DNS_SERVERS / EXPANSO_EDGE_ORCHESTRATOR_RESOLV_CONF)."
++	hint := "DNS lookup failed. Check network DNS or configure overrides via dns.servers / dns.resolv_conf (EXPANSO_EDGE_DNS_SERVERS / EXPANSO_EDGE_DNS_RESOLV_CONF)."
+ 	natsErr := errors.Newf("unable to resolve NATS host '%s'", host).
+ 		WithCode(errors.CodeNetworkError).
+ 		WithHint(hint).
+diff --git a/types/config_edge.go b/types/config_edge.go
+index 44a0145..6f78202 100644
+--- a/types/config_edge.go
++++ b/types/config_edge.go
+@@ -65,6 +65,17 @@ type EdgeConfig struct {
+ 	// If this directory is lost, node must be re-bootstrapped with new credentials.
+ 	DataDir string `json:"data_dir"`
+ 
++	// DNS overrides used by bootstrap, control plane (NATS), and telemetry.
++	//
++	// WHEN TO USE:
++	// - Android/Termux or environments with broken system DNS
++	// - Restricted networks requiring custom resolvers
++	//
++	// NOTE:
++	// This is the single DNS override for the edge process. Component-specific
++	// DNS settings are deprecated and must match this value if still present.
++	DNS DNSConfig `json:"dns,omitempty" yaml:"dns,omitempty"`
++
+ 	// LocalMode enables standalone operation without control plane connection.
+ 	//
+ 	// WHEN TO USE TRUE:
+@@ -336,12 +347,11 @@ type EdgeOrchestratorConfig struct {
+ 	// Disables all control plane authentication. For development/testing only.
+ 	Insecure bool `json:"insecure,omitempty" yaml:"insecure,omitempty"`
+ 
+-	// DNSServers overrides DNS servers used for NATS connections.
++	// Deprecated: use top-level dns.servers/resolv_conf instead.
+ 	// Example: ["8.8.8.8", "1.1.1.1"]
+ 	DNSServers []string `json:"dns_servers,omitempty" yaml:"dns_servers,omitempty"`
+ 
+-	// ResolvConf points to a resolv.conf file to derive DNS servers for NATS connections.
+-	// Use when the system resolver is incorrect or inaccessible.
++	// Deprecated: use top-level dns.servers/resolv_conf instead.
+ 	ResolvConf string `json:"resolv_conf,omitempty" yaml:"resolv_conf,omitempty"`
+ }
+ 
+@@ -360,6 +370,7 @@ func (c *EdgeConfig) Validate() error {
+ 
+ 		// Nested struct validations
+ 		c.validateOrchestrator(),
++		c.validateDNSOverrides(),
+ 		c.API.Validate(),
+ 		c.Log.Validate(),
+ 		c.Telemetry.Validate(),
+@@ -387,6 +398,51 @@ func (c *EdgeConfig) validateOrchestrator() error {
+ 	return c.Orchestrator.Validate()
+ }
+ 
++func (c *EdgeConfig) validateDNSOverrides() error {
++	configs := map[string]DNSConfig{}
++
++	if !c.DNS.IsEmpty() {
++		configs["dns"] = c.DNS
++	}
++	if c.Orchestrator != nil {
++		legacy := DNSConfig{
++			Servers:    c.Orchestrator.DNSServers,
++			ResolvConf: c.Orchestrator.ResolvConf,
++		}
++		if !legacy.IsEmpty() {
++			configs["orchestrator"] = legacy
++		}
++	}
++	legacyTelemetry := DNSConfig{
++		Servers:    c.Telemetry.DNSServers,
++		ResolvConf: c.Telemetry.ResolvConf,
++	}
++	if !legacyTelemetry.IsEmpty() {
++		configs["telemetry"] = legacyTelemetry
++	}
++
++	if len(configs) <= 1 {
++		return nil
++	}
++
++	var baseKey string
++	var base DNSConfig
++	for key, cfg := range configs {
++		baseKey = key
++		base = cfg
++		break
++	}
++	for key, cfg := range configs {
++		if !base.Equals(cfg) {
++			return errors.Newf("dns overrides must match across dns/orchestrator/telemetry (mismatch between %s and %s)", baseKey, key).
++				WithCode(errors.CodeValidation).
++				WithHint("Set only dns.servers/resolv_conf or ensure all overrides are identical")
++		}
++	}
++
++	return nil
++}
++
+ // Validate validates the orchestrator configuration
+ func (o *EdgeOrchestratorConfig) Validate() error {
+ 	// No user-configurable timing fields to validate
+@@ -514,7 +570,36 @@ func (c *EdgeConfig) IsTelemetryEnabled() bool {
+ 
+ // GetTelemetryConfig returns the telemetry configuration
+ func (c *EdgeConfig) GetTelemetryConfig() *TelemetryConfig {
+-	return &c.Telemetry
++	cfg := c.Telemetry
++	if dns := c.GetDNSConfig(); !dns.IsEmpty() {
++		cfg.DNSServers = dns.Servers
++		cfg.ResolvConf = dns.ResolvConf
++	}
++	return &cfg
++}
++
++// GetDNSConfig returns the effective DNS config for this edge node.
++func (c *EdgeConfig) GetDNSConfig() DNSConfig {
++	if !c.DNS.IsEmpty() {
++		return c.DNS
++	}
++	if c.Orchestrator != nil {
++		legacy := DNSConfig{
++			Servers:    c.Orchestrator.DNSServers,
++			ResolvConf: c.Orchestrator.ResolvConf,
++		}
++		if !legacy.IsEmpty() {
++			return legacy
++		}
++	}
++	legacy := DNSConfig{
++		Servers:    c.Telemetry.DNSServers,
++		ResolvConf: c.Telemetry.ResolvConf,
++	}
++	if !legacy.IsEmpty() {
++		return legacy
++	}
++	return DNSConfig{}
+ }
+ 
+ // GetConnectionConfig returns the connection configuration for the orchestrator
+@@ -522,6 +607,7 @@ func (c *EdgeConfig) GetConnectionConfig() ConnectionConfig {
+ 	if c.Orchestrator == nil {
+ 		return ConnectionConfig{}
+ 	}
++	dns := c.GetDNSConfig()
+ 	return ConnectionConfig{
+ 		NodeID:          c.Orchestrator.NodeID,
+ 		NetworkID:       c.Orchestrator.NetworkID,
+@@ -530,7 +616,7 @@ func (c *EdgeConfig) GetConnectionConfig() ConnectionConfig {
+ 		RefreshAddress:  c.Orchestrator.RefreshAddress,
+ 		RequireTLS:      c.Orchestrator.RequireTLS,
+ 		Insecure:        c.Orchestrator.Insecure,
+-		DNSServers:      c.Orchestrator.DNSServers,
+-		ResolvConf:      c.Orchestrator.ResolvConf,
++		DNSServers:      dns.Servers,
++		ResolvConf:      dns.ResolvConf,
+ 	}
+ }
+diff --git a/types/dns.go b/types/dns.go
+new file mode 100644
+index 0000000..fd37136
+--- /dev/null
++++ b/types/dns.go
+@@ -0,0 +1,92 @@
++package types
++
++import (
++	"net"
++	"sort"
++	"strings"
++)
++
++// DNSConfig defines DNS override settings shared across edge components.
++type DNSConfig struct {
++	// Servers overrides DNS resolution to use the provided servers.
++	// Example: ["8.8.8.8", "1.1.1.1"]
++	Servers []string `json:"servers,omitempty" yaml:"servers,omitempty"`
++
++	// ResolvConf points to a resolv.conf file to derive DNS servers.
++	ResolvConf string `json:"resolv_conf,omitempty" yaml:"resolv_conf,omitempty"`
++}
++
++// IsEmpty returns true if no DNS override is configured.
++func (c DNSConfig) IsEmpty() bool {
++	return len(c.Servers) == 0 && strings.TrimSpace(c.ResolvConf) == ""
++}
++
++// Equals returns true if both configs resolve to the same normalized settings.
++func (c DNSConfig) Equals(other DNSConfig) bool {
++	a := c.normalized()
++	b := other.normalized()
++	if a.ResolvConf != b.ResolvConf {
++		return false
++	}
++	if len(a.Servers) != len(b.Servers) {
++		return false
++	}
++	for i := range a.Servers {
++		if a.Servers[i] != b.Servers[i] {
++			return false
++		}
++	}
++	return true
++}
++
++func (c DNSConfig) normalized() DNSConfig {
++	servers := normalizeDNSServerList(c.Servers)
++	sort.Strings(servers)
++	return DNSConfig{
++		Servers:    servers,
++		ResolvConf: strings.TrimSpace(c.ResolvConf),
++	}
++}
++
++func normalizeDNSServerList(servers []string) []string {
++	if len(servers) == 0 {
++		return nil
++	}
++	normalized := []string{}
++	seen := map[string]struct{}{}
++	for _, server := range servers {
++		server = strings.TrimSpace(server)
++		if server == "" {
++			continue
++		}
++		addr := normalizeDNSServerAddr(server)
++		if addr == "" {
++			continue
++		}
++		if _, ok := seen[addr]; ok {
++			continue
++		}
++		seen[addr] = struct{}{}
++		normalized = append(normalized, addr)
++	}
++	return normalized
++}
++
++func normalizeDNSServerAddr(server string) string {
++	if server == "" {
++		return ""
++	}
++	if host, port, err := net.SplitHostPort(server); err == nil {
++		if port == "" {
++			port = "53"
++		}
++		return net.JoinHostPort(host, port)
++	}
++	if ip := net.ParseIP(server); ip != nil {
++		return net.JoinHostPort(server, "53")
++	}
++	if strings.Count(server, ":") >= 2 {
++		return net.JoinHostPort(server, "53")
++	}
++	return net.JoinHostPort(server, "53")
++}
+diff --git a/types/telemetry.go b/types/telemetry.go
+index d3c87ea..fcde427 100644
+--- a/types/telemetry.go
++++ b/types/telemetry.go
+@@ -60,12 +60,11 @@ type TelemetryConfig struct {
+ 	// Example: ["db.", "ncl."] to drop all db.* and ncl.* metrics
+ 	DropMetricPrefixes []string `json:"drop_metric_prefixes,omitempty" yaml:"drop_metric_prefixes,omitempty" `
+ 
+-	// DNSServers overrides DNS servers used for telemetry exporters (HTTP protocol only).
++	// Deprecated: use top-level dns.servers/resolv_conf instead.
+ 	// Example: ["8.8.8.8", "1.1.1.1"]
+ 	DNSServers []string `json:"dns_servers,omitempty" yaml:"dns_servers,omitempty" `
+ 
+-	// ResolvConf points to a resolv.conf file to derive DNS servers for telemetry exporters.
+-	// Only applies to HTTP protocol exporters.
++	// Deprecated: use top-level dns.servers/resolv_conf instead.
+ 	ResolvConf string `json:"resolv_conf,omitempty" yaml:"resolv_conf,omitempty" `
+ 
+ 	// Optional authentication configuration for telemetry exporters
+-- 
+2.52.0
+
