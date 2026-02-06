@@ -1,153 +1,128 @@
-diff --git a/shared/bootstrap/diagnostics.go b/shared/bootstrap/diagnostics.go
-index e5cdf6e9..5bbbe7b0 100644
---- a/shared/bootstrap/diagnostics.go
-+++ b/shared/bootstrap/diagnostics.go
-@@ -1,14 +1,19 @@
- package bootstrap
+diff --git a/shared/bootstrap/client.go b/shared/bootstrap/client.go
+index 81d8c3b..d6c2fc6 100644
+--- a/shared/bootstrap/client.go
++++ b/shared/bootstrap/client.go
+@@ -2,7 +2,10 @@ package bootstrap
  
  import (
-+	"bufio"
  	"context"
- 	"crypto/tls"
++	stderrors "errors"
  	"fmt"
- 	"net"
- 	"net/http"
- 	"net/url"
-+	"os"
-+	"os/exec"
-+	"runtime"
- 	"strings"
++	"net/http"
++	"strings"
  	"time"
- )
-@@ -77,6 +82,20 @@ func runBootstrapDiagnostics(ctx context.Context, baseURL string, cfg diagnostic
- 	if err != nil {
- 		result.add("URL", fmt.Sprintf("invalid (%v)", err))
- 		return result
- 	}
-+
-+	resolvStatus, resolvServers := resolvConfSummary()
-+	if resolvStatus != "" {
-+		result.add("Resolver", resolvStatus)
-+	}
-+	if len(resolvServers) > 0 {
-+		result.add("DNS Servers", strings.Join(resolvServers, ", "))
-+	}
-+	if runtime.GOOS == "android" {
-+		if props := androidDNSProps(); len(props) > 0 {
-+			result.add("Android DNS", strings.Join(props, ", "))
-+		}
-+	}
  
- 	proxyStatus, proxyURL := proxyDescription(target.url, cfg.disableProxy)
- 	result.add("Proxy", proxyStatus)
-@@ -205,6 +224,118 @@ func parseDiagnosticTarget(baseURL string) (diagnosticTarget, error) {
+ 	"github.com/expanso-io/expanso/lib/errors"
+@@ -34,6 +37,8 @@ func getContextDeadline(ctx context.Context) string {
+ // Client handles communication with the bootstrap service
+ type Client struct {
+ 	http *req.Client
++	base string
++	diag diagnosticsConfig
+ }
+ 
+ // ClientConfig contains configuration for the bootstrap client
+@@ -96,6 +101,13 @@ func NewClient(config ClientConfig) (*Client, error) {
+ 
+ 	return &Client{
+ 		http: httpClient,
++		base: config.BaseURL,
++		diag: diagnosticsConfig{
++			disableProxy:       config.DisableProxy,
++			forceIPv4:          config.ForceIPv4,
++			insecureSkipVerify: config.InsecureSkipVerify,
++			timeout:            config.Timeout,
++		},
  	}, nil
  }
  
-+func resolvConfSummary() (string, []string) {
-+	contents, path, err := readResolvConf()
-+	if err != nil {
-+		return "resolv.conf missing", nil
-+	}
-+	servers := parseResolvConf(contents)
-+	if len(servers) == 0 {
-+		return fmt.Sprintf("%s (no nameserver entries)", path), nil
-+	}
-+
-+	annotated := make([]string, 0, len(servers))
-+	for _, server := range servers {
-+		if isLoopback(server) {
-+			annotated = append(annotated, server+" (loopback)")
-+		} else {
-+			annotated = append(annotated, server)
+@@ -110,6 +122,9 @@ func (c *Client) Bootstrap(ctx context.Context, req *BootstrapRequest) (*Bootstr
+ 		Post("/api/v1/register")
+ 
+ 	if err != nil {
++		if enhanced := c.enhanceBootstrapError(ctx, err); enhanced != nil {
++			return nil, enhanced
 +		}
-+	}
+ 		return nil, fmt.Errorf("bootstrap request failed: %w", err)
+ 	}
+ 	// Validate response
+@@ -134,3 +149,79 @@ func (c *Client) Bootstrap(ctx context.Context, req *BootstrapRequest) (*Bootstr
+ 
+ 	return &response, nil
+ }
 +
-+	return path, annotated
-+}
-+
-+func readResolvConf() (string, string, error) {
-+	candidates := []string{"/etc/resolv.conf"}
-+	if prefix := os.Getenv("PREFIX"); prefix != "" {
-+		candidates = append(candidates, prefix+"/etc/resolv.conf")
-+	}
-+
-+	for _, path := range candidates {
-+		data, err := os.ReadFile(path)
-+		if err != nil {
-+			continue
-+		}
-+		return string(data), path, nil
-+	}
-+
-+	return "", "", fmt.Errorf("resolv.conf not found")
-+}
-+
-+func parseResolvConf(contents string) []string {
-+	if contents == "" {
++func (c *Client) enhanceBootstrapError(ctx context.Context, err error) error {
++	var structuredErr *errors.Error
++	if !stderrors.As(err, &structuredErr) {
 +		return nil
 +	}
-+	servers := []string{}
-+	seen := map[string]struct{}{}
 +
-+	scanner := bufio.NewScanner(strings.NewReader(contents))
-+	for scanner.Scan() {
-+		line := strings.TrimSpace(scanner.Text())
-+		if line == "" || strings.HasPrefix(line, "#") {
-+			continue
-+		}
-+		fields := strings.Fields(line)
-+		if len(fields) < 2 || fields[0] != "nameserver" {
-+			continue
-+		}
-+		server := fields[1]
-+		if _, ok := seen[server]; ok {
-+			continue
-+		}
-+		seen[server] = struct{}{}
-+		servers = append(servers, server)
-+	}
-+	return servers
-+}
-+
-+func isLoopback(server string) bool {
-+	return server == "127.0.0.1" || server == "::1" || strings.HasPrefix(server, "127.0.0.")
-+}
-+
-+func androidDNSProps() []string {
-+	props := []string{"net.dns1", "net.dns2", "net.dns3", "net.dns4"}
-+	results := []string{}
-+	seen := map[string]struct{}{}
-+
-+	for _, prop := range props {
-+		value, err := runGetprop(prop)
-+		if err != nil {
-+			continue
-+		}
-+		value = strings.TrimSpace(value)
-+		if value == "" {
-+			continue
-+		}
-+		entry := fmt.Sprintf("%s=%s", prop, value)
-+		if _, ok := seen[entry]; ok {
-+			continue
-+		}
-+		seen[entry] = struct{}{}
-+		results = append(results, entry)
++	switch structuredErr.HTTPStatus {
++	case http.StatusUnauthorized:
++		return structuredErr.Copy().WithHint(
++			"Bootstrap token is invalid or expired. " +
++				"Generate a new token in https://cloud.expanso.io and try again.",
++		)
++	case http.StatusForbidden:
++		return structuredErr.Copy().WithHint(
++			"Bootstrap token is not authorized for this workspace. " +
++				"Generate a new token in https://cloud.expanso.io and try again.",
++		)
 +	}
 +
-+	return results
-+}
++	if isNetworkBootstrapError(structuredErr) {
++		enhanced := structuredErr.Copy()
++		if structuredErr.Code == errors.CodeServiceUnavailable &&
++			strings.Contains(strings.ToLower(structuredErr.Message), "connection refused") {
++			hint := enhanced.Hint
++			if hint != "" {
++				hint += "\n\n"
++			}
++			hint += "If this endpoint is known to be up, check local network/proxy settings and try forcing IPv4 if supported. " +
++				"For diagnostics, run: curl -4 -v <bootstrap_url>/api/v1/register with the same token."
++			enhanced = enhanced.WithHint(hint)
++		}
 +
-+func runGetprop(key string) (string, error) {
-+	cmd := exec.Command("getprop", key)
-+	out, err := cmd.Output()
-+	if err != nil {
-+		return "", err
++		diagCtx := ctx
++		if diagCtx == nil || diagCtx.Err() != nil {
++			diagCtx = context.Background()
++		}
++		diagnostics := runBootstrapDiagnostics(diagCtx, c.base, c.diag)
++		return appendDiagnostics(enhanced, diagnostics)
 +	}
-+	return string(out), nil
++
++	return structuredErr
 +}
 +
- func defaultPort(scheme string) string {
- 	switch strings.ToLower(scheme) {
- 	case schemeHTTPS:
++func isNetworkBootstrapError(err *errors.Error) bool {
++	if err == nil {
++		return false
++	}
++	if err.Code == errors.CodeRequestCancelled {
++		return false
++	}
++	if err.Details == nil {
++		return false
++	}
++	return err.Details["root_error"] != ""
++}
++
++func appendDiagnostics(err *errors.Error, diagnostics diagnosticResult) *errors.Error {
++	if err == nil || len(diagnostics.lines) == 0 {
++		return err
++	}
++
++	hint := diagnostics.hint()
++	if hint != "" {
++		if err.Hint != "" {
++			hint = err.Hint + "\n\n" + hint
++		}
++		err = err.WithHint(hint)
++	}
++
++	for key, value := range diagnostics.details {
++		err = err.WithDetail(key, value)
++	}
++
++	return err
++}
