@@ -1,0 +1,157 @@
+From 774ed6183efd0c8dbc39e0763adcaa282fefe19a Mon Sep 17 00:00:00 2001
+From: David Aronchick <aronchick@gmail.com>
+Date: Thu, 5 Feb 2026 21:32:55 -0800
+Subject: [PATCH] feat: add DNS override support to http client
+
+---
+ shared/http/client.go | 105 ++++++++++++++++++++++++++++++++++++++++--
+ shared/http/config.go |   6 +++
+ 2 files changed, 106 insertions(+), 5 deletions(-)
+
+diff --git a/shared/http/client.go b/shared/http/client.go
+index 8484abb..c2cdf0f 100644
+--- a/shared/http/client.go
++++ b/shared/http/client.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"crypto/tls"
+ 	"net"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/expanso-io/expanso/shared/version"
+@@ -59,11 +60,16 @@ func NewClient(config Config) (*req.Client, error) {
+ 		client.SetProxy(nil)
+ 	}
+ 
+-	// Force IPv4 connections if requested
+-	if config.ForceIPv4 {
+-		client.SetDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
+-			dialer := net.Dialer{Timeout: config.Timeout}
+-			return dialer.DialContext(ctx, "tcp4", addr)
++	dialer := buildDialer(config)
++
++	// Force IPv4 connections if requested (or provide custom resolver)
++	if config.ForceIPv4 || dialer.Resolver != nil {
++		network := "tcp"
++		if config.ForceIPv4 {
++			network = "tcp4"
++		}
++		client.SetDial(func(ctx context.Context, _, addr string) (net.Conn, error) {
++			return dialer.DialContext(ctx, network, addr)
+ 		})
+ 	}
+ 
+@@ -83,3 +89,92 @@ func NewClient(config Config) (*req.Client, error) {
+ 
+ 	return client, nil
+ }
++
++func buildDialer(config Config) net.Dialer {
++	dialer := net.Dialer{Timeout: config.Timeout}
++	if !config.PreferGoDNS && len(config.DNSServers) == 0 {
++		return dialer
++	}
++
++	baseDialer := net.Dialer{Timeout: config.Timeout}
++	servers := normalizeDNSServers(config.DNSServers)
++
++	resolver := &net.Resolver{
++		PreferGo: true,
++	}
++	if len(servers) > 0 {
++		resolver.Dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
++			server := servers[0]
++			dnsNetwork := dnsDialNetwork(network, config.ForceIPv4)
++			return baseDialer.DialContext(ctx, dnsNetwork, server)
++		}
++	}
++
++	dialer.Resolver = resolver
++	return dialer
++}
++
++func dnsDialNetwork(network string, forceIPv4 bool) string {
++	network = strings.ToLower(network)
++	switch {
++	case strings.HasPrefix(network, "tcp"):
++		if forceIPv4 {
++			return "tcp4"
++		}
++		return "tcp"
++	case strings.HasPrefix(network, "udp"):
++		if forceIPv4 {
++			return "udp4"
++		}
++		return "udp"
++	default:
++		if forceIPv4 {
++			return "tcp4"
++		}
++		return "tcp"
++	}
++}
++
++func normalizeDNSServers(servers []string) []string {
++	if len(servers) == 0 {
++		return nil
++	}
++
++	normalized := []string{}
++	seen := map[string]struct{}{}
++	for _, server := range servers {
++		server = strings.TrimSpace(server)
++		if server == "" {
++			continue
++		}
++		addr := normalizeDNSServerAddr(server)
++		if addr == "" {
++			continue
++		}
++		if _, ok := seen[addr]; ok {
++			continue
++		}
++		seen[addr] = struct{}{}
++		normalized = append(normalized, addr)
++	}
++	return normalized
++}
++
++func normalizeDNSServerAddr(server string) string {
++	if server == "" {
++		return ""
++	}
++	if host, port, err := net.SplitHostPort(server); err == nil {
++		if port == "" {
++			port = "53"
++		}
++		return net.JoinHostPort(host, port)
++	}
++	if ip := net.ParseIP(server); ip != nil {
++		return net.JoinHostPort(server, "53")
++	}
++	if strings.Count(server, ":") >= 2 {
++		return net.JoinHostPort(server, "53")
++	}
++	return net.JoinHostPort(server, "53")
++}
+diff --git a/shared/http/config.go b/shared/http/config.go
+index fe74960..af9f7f0 100644
+--- a/shared/http/config.go
++++ b/shared/http/config.go
+@@ -34,6 +34,12 @@ type Config struct {
+ 	// ForceIPv4 forces IPv4 for TCP connections (useful on networks with broken IPv6)
+ 	ForceIPv4 bool
+ 
++	// PreferGoDNS forces the Go DNS resolver (useful on platforms with broken system DNS)
++	PreferGoDNS bool
++
++	// DNSServers overrides DNS resolution to use the provided servers (e.g. 8.8.8.8, 1.1.1.1)
++	DNSServers []string
++
+ 	// Auth configuration
+ 	Auth AuthConfig
+ }
+-- 
+2.52.0
+
