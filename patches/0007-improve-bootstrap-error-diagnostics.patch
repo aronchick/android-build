@@ -126,7 +126,7 @@ index 81d8c3b1..d6c2fc6f 100644
 +
 +	return err
 +}
- diff --git a/shared/bootstrap/diagnostics.go b/shared/bootstrap/diagnostics.go
+diff --git a/shared/bootstrap/diagnostics.go b/shared/bootstrap/diagnostics.go
 new file mode 100644
 index 00000000..e5cdf6e9
 --- /dev/null

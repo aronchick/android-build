@@ -39,9 +39,8 @@ index e05ac2a7..9a22f958 100644
  	if host == "" {
  		host = reqURL
  	}
--
+ 
 -	// Check for URL errors
-+
 +	return hostDetails{
 +		host:     host,
 +		hostname: parsedURL.Hostname(),
@@ -78,33 +77,6 @@ index e05ac2a7..9a22f958 100644
 -				WithCode(errors.CodeTimeout).
 -				WithHint("Try increasing the timeout, check your network connection, or verify the server is responding")
 -		}
--
--		// Check the underlying error
--		errStr := urlErr.Err.Error()
--		switch {
--		case strings.Contains(errStr, "proxyconnect"):
--			return withRootCause(errors.Newf("proxy connection failed while reaching %s", host).
--				WithCode(errors.CodeServiceUnavailable).
--				WithHint("Check HTTP_PROXY/HTTPS_PROXY/NO_PROXY environment variables and proxy availability").
--				WithDetail("proxy_error", errStr), rootErr)
--		case strings.Contains(errStr, "no such host"):
--			return withRootCause(errors.Newf("unable to resolve host '%s'", parsedURL.Hostname()).
--				WithCode(errors.CodeBadRequest).
--				WithHint("Check if the hostname is spelled correctly and that DNS is working"), rootErr)
--		case strings.Contains(errStr, "connection refused"):
--			hint := fmt.Sprintf(`The server at %s refused the connection. To resolve this:
--1. Ensure the server is running
--2. Check if the port is correct
--3. Verify firewall settings allow the connection
--4. If using localhost, ensure the service is bound to the correct interface`, host)
--
--			return withRootCause(errors.Newf("connection refused by server at %s", host).
--				WithCode(errors.CodeServiceUnavailable).
--				WithHint(hint), rootErr)
--		}
--	}
--
--	// Check for net.Error
 +	if !stderrors.As(err, &urlErr) {
 +		return nil, err
 +	}
@@ -134,7 +106,29 @@ index e05ac2a7..9a22f958 100644
 +	if dnsMsg == "" {
 +		dnsMsg = h.hostname
 +	}
-+
+ 
+-		// Check the underlying error
+-		errStr := urlErr.Err.Error()
+-		switch {
+-		case strings.Contains(errStr, "proxyconnect"):
+-			return withRootCause(errors.Newf("proxy connection failed while reaching %s", host).
+-				WithCode(errors.CodeServiceUnavailable).
+-				WithHint("Check HTTP_PROXY/HTTPS_PROXY/NO_PROXY environment variables and proxy availability").
+-				WithDetail("proxy_error", errStr), rootErr)
+-		case strings.Contains(errStr, "no such host"):
+-			return withRootCause(errors.Newf("unable to resolve host '%s'", parsedURL.Hostname()).
+-				WithCode(errors.CodeBadRequest).
+-				WithHint("Check if the hostname is spelled correctly and that DNS is working"), rootErr)
+-		case strings.Contains(errStr, "connection refused"):
+-			hint := fmt.Sprintf(`The server at %s refused the connection. To resolve this:
+-1. Ensure the server is running
+-2. Check if the port is correct
+-3. Verify firewall settings allow the connection
+-4. If using localhost, ensure the service is bound to the correct interface`, host)
+-
+-			return withRootCause(errors.Newf("connection refused by server at %s", host).
+-				WithCode(errors.CodeServiceUnavailable).
+-				WithHint(hint), rootErr)
 +	e := h.add(errors.Newf("unable to resolve host '%s'", dnsMsg).
 +		WithCode(errors.CodeBadRequest).
 +		WithHint(hint))
@@ -197,9 +191,10 @@ index e05ac2a7..9a22f958 100644
 +	if sysErr, ok := opErr.Err.(*os.SyscallError); ok {
 +		if handled := handleDialSyscall(sysErr, h, rootErr, opErr.Addr); handled != nil {
 +			return handled
-+		}
-+	}
-+
+ 		}
+ 	}
+ 
+-	// Check for net.Error
 +	e := addDialDetails(errors.Newf("failed to establish connection to %s", h.host).
 +		WithCode(errors.CodeServiceUnavailable).
 +		WithHint("The server might be down or unreachable. Check network connectivity and server status"), h, nil, opErr.Addr)
@@ -214,7 +209,10 @@ index e05ac2a7..9a22f958 100644
 -				WithCode(errors.CodeTimeout).
 -				WithHint("This might be due to network issues or an unresponsive server"), rootErr)
 -		}
--
++	if !stderrors.As(err, &netErr) {
++		return nil
++	}
+ 
 -		// Check for specific network operation errors
 -		if opErr, ok := netErr.(*net.OpError); ok {
 -			if opErr.Op == "dial" {
@@ -223,13 +221,6 @@ index e05ac2a7..9a22f958 100644
 -					WithHint("The server might be down or unreachable. Check network connectivity and server status"), rootErr)
 -			}
 -		}
--	}
--
--	// Check for common error patterns in error string
-+	if !stderrors.As(err, &netErr) {
-+		return nil
-+	}
-+
 +	if netErr.Timeout() {
 +		e := h.add(errors.Newf("network operation timed out while connecting to %s", h.host).
 +			WithCode(errors.CodeTimeout).
@@ -242,8 +233,9 @@ index e05ac2a7..9a22f958 100644
 +			WithCode(errors.CodeServiceUnavailable).
 +			WithHint("The server might be down or unreachable. Check network connectivity and server status"))
 +		return withRootCause(e, rootErr)
-+	}
-+
+ 	}
+ 
+-	// Check for common error patterns in error string
 +	return nil
 +}
 +
@@ -310,7 +302,7 @@ index e05ac2a7..9a22f958 100644
 +		return withRootCause(e, rootErr)
  	}
  }
-+
+ 
 +// handleNetworkError categorizes network errors more precisely
 +func handleNetworkError(err error, reqURL string) *errors.Error {
 +	rootErr := err.Error()
@@ -334,3 +326,7 @@ index e05ac2a7..9a22f958 100644
 +
 +	return handleErrorStringPatterns(err, h, parsedURL, rootErr)
 +}
++
+ func withRootCause(err *errors.Error, root string) *errors.Error {
+ 	if root != "" {
+ 		err = err.WithDetail("root_error", root)
