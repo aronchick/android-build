@@ -1,130 +1,336 @@
 diff --git a/shared/http/errors.go b/shared/http/errors.go
-index d0b8b607..e05ac2a7 100644
+index e05ac2a7..9a22f958 100644
 --- a/shared/http/errors.go
 +++ b/shared/http/errors.go
-@@ -108,6 +108,8 @@ func createHTTPStatusError(resp *req.Response) *errors.Error {
+@@ -7,7 +7,9 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"net/url"
++	"os"
+ 	"strings"
++	"syscall"
  
- // handleNetworkError categorizes network errors more precisely
- func handleNetworkError(err error, reqURL string) *errors.Error {
-+	rootErr := err.Error()
+ 	"github.com/expanso-io/expanso/lib/errors"
+ 	"github.com/imroc/req/v3"
+@@ -106,98 +108,255 @@ func createHTTPStatusError(resp *req.Response) *errors.Error {
+ 	return e
+ }
+ 
+-// handleNetworkError categorizes network errors more precisely
+-func handleNetworkError(err error, reqURL string) *errors.Error {
+-	rootErr := err.Error()
++type hostDetails struct {
++	host     string
++	hostname string
++	port     string
++}
 +
- 	// Parse URL to get host and port for better error messages
- 	parsedURL, _ := url.Parse(reqURL)
++func parseHostDetails(reqURL string) (hostDetails, *url.URL) {
++	parsedURL, err := url.Parse(reqURL)
++	if err != nil || parsedURL == nil {
++		return hostDetails{
++			host: reqURL,
++		}, &url.URL{}
++	}
+ 
+-	// Parse URL to get host and port for better error messages
+-	parsedURL, _ := url.Parse(reqURL)
  	host := parsedURL.Host
-@@ -127,10 +129,15 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
- 		// Check the underlying error
- 		errStr := urlErr.Err.Error()
- 		switch {
-+		case strings.Contains(errStr, "proxyconnect"):
-+			return withRootCause(errors.Newf("proxy connection failed while reaching %s", host).
-+				WithCode(errors.CodeServiceUnavailable).
-+				WithHint("Check HTTP_PROXY/HTTPS_PROXY/NO_PROXY environment variables and proxy availability").
-+				WithDetail("proxy_error", errStr), rootErr)
- 		case strings.Contains(errStr, "no such host"):
--			return errors.Newf("unable to resolve host '%s'", parsedURL.Hostname()).
-+			return withRootCause(errors.Newf("unable to resolve host '%s'", parsedURL.Hostname()).
- 				WithCode(errors.CodeBadRequest).
--				WithHint("Check if the hostname is spelled correctly and that DNS is working")
-+				WithHint("Check if the hostname is spelled correctly and that DNS is working"), rootErr)
- 		case strings.Contains(errStr, "connection refused"):
- 			hint := fmt.Sprintf(`The server at %s refused the connection. To resolve this:
- 1. Ensure the server is running
-@@ -138,9 +145,9 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
- 3. Verify firewall settings allow the connection
- 4. If using localhost, ensure the service is bound to the correct interface`, host)
- 
--			return errors.Newf("connection refused by server at %s", host).
-+			return withRootCause(errors.Newf("connection refused by server at %s", host).
- 				WithCode(errors.CodeServiceUnavailable).
--				WithHint(hint)
-+				WithHint(hint), rootErr)
- 		}
+ 	if host == "" {
+ 		host = reqURL
  	}
- 
-@@ -148,17 +155,17 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
- 	var netErr net.Error
- 	if stderrors.As(err, &netErr) {
- 		if netErr.Timeout() {
--			return errors.Newf("network operation timed out while connecting to %s", host).
-+			return withRootCause(errors.Newf("network operation timed out while connecting to %s", host).
- 				WithCode(errors.CodeTimeout).
--				WithHint("This might be due to network issues or an unresponsive server")
-+				WithHint("This might be due to network issues or an unresponsive server"), rootErr)
- 		}
- 
- 		// Check for specific network operation errors
- 		if opErr, ok := netErr.(*net.OpError); ok {
- 			if opErr.Op == "dial" {
--				return errors.Newf("failed to establish connection to %s", host).
-+				return withRootCause(errors.Newf("failed to establish connection to %s", host).
- 					WithCode(errors.CodeServiceUnavailable).
--					WithHint("The server might be down or unreachable. Check network connectivity and server status")
-+					WithHint("The server might be down or unreachable. Check network connectivity and server status"), rootErr)
- 			}
- 		}
- 	}
-@@ -167,26 +174,33 @@ func handleNetworkError(err error, reqURL string) *errors.Error {
- 	errStr := err.Error()
- 	switch {
- 	case strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline exceeded"):
--		return errors.Newf("request to %s timed out", host).
-+		return withRootCause(errors.Newf("request to %s timed out", host).
- 			WithCode(errors.CodeTimeout).
--			WithHint("The operation took too long. Consider increasing the timeout or checking server performance")
-+			WithHint("The operation took too long. Consider increasing the timeout or checking server performance"), rootErr)
- 	case strings.Contains(errStr, "connection reset"):
--		return errors.Newf("connection to %s was reset by the server", host).
-+		return withRootCause(errors.Newf("connection to %s was reset by the server", host).
- 			WithCode(errors.CodeServiceUnavailable).
--			WithHint("The server closed the connection unexpectedly. This might indicate a server issue or network problem")
-+			WithHint("The server closed the connection unexpectedly. This might indicate a server issue or network problem"), rootErr)
- 	case strings.Contains(errStr, "broken pipe"):
--		return errors.Newf("connection to %s was broken during data transfer", host).
-+		return withRootCause(errors.Newf("connection to %s was broken during data transfer", host).
- 			WithCode(errors.CodeNetworkError).
--			WithHint("The connection was interrupted. " +
--				"This often happens when the server closes the connection while data is being sent")
-+			WithHint("The connection was interrupted. "+
-+				"This often happens when the server closes the connection while data is being sent"), rootErr)
- 	case strings.Contains(errStr, "certificate") || strings.Contains(errStr, "x509"):
--		return errors.Newf("TLS certificate validation failed for %s", host).
-+		return withRootCause(errors.Newf("TLS certificate validation failed for %s", host).
- 			WithCode(errors.CodeBadRequest).
--			WithHint("The server's certificate is invalid or untrusted. Verify the certificate or use proper CA certificates")
-+			WithHint("The server's certificate is invalid or untrusted. Verify the certificate or use proper CA certificates"), rootErr)
- 	default:
- 		// Generic network error
--		return errors.Newf("network error occurred while connecting to %s: %v", host, err).
-+		return withRootCause(errors.Newf("network error occurred while connecting to %s: %v", host, err).
- 			WithCode(errors.CodeNetworkError).
--			WithHint("Check your network connection and try again")
-+			WithHint("Check your network connection and try again"), rootErr)
+-
+-	// Check for URL errors
++
++	return hostDetails{
++		host:     host,
++		hostname: parsedURL.Hostname(),
++		port:     parsedURL.Port(),
++	}, parsedURL
++}
++
++func (h hostDetails) add(err *errors.Error) *errors.Error {
++	if h.hostname != "" {
++		err = err.WithDetail("host", h.hostname)
++	}
++	if h.port != "" {
++		err = err.WithDetail("port", h.port)
++	}
++	return err
++}
++
++func addDialDetails(err *errors.Error, h hostDetails, sysErr *os.SyscallError, addr net.Addr) *errors.Error {
++	err = h.add(err)
++	if sysErr != nil {
++		err = err.WithDetail("syscall", sysErr.Err.Error())
++	}
++	if addr != nil {
++		err = err.WithDetail("dial_addr", addr.String())
++	}
++	return err
++}
++
++func unwrapURLError(err error, h hostDetails, rootErr string) (*errors.Error, error) {
+ 	var urlErr *url.Error
+-	if stderrors.As(err, &urlErr) {
+-		if urlErr.Timeout() {
+-			return errors.Newf("connection to %s timed out", host).
+-				WithCode(errors.CodeTimeout).
+-				WithHint("Try increasing the timeout, check your network connection, or verify the server is responding")
+-		}
+-
+-		// Check the underlying error
+-		errStr := urlErr.Err.Error()
+-		switch {
+-		case strings.Contains(errStr, "proxyconnect"):
+-			return withRootCause(errors.Newf("proxy connection failed while reaching %s", host).
+-				WithCode(errors.CodeServiceUnavailable).
+-				WithHint("Check HTTP_PROXY/HTTPS_PROXY/NO_PROXY environment variables and proxy availability").
+-				WithDetail("proxy_error", errStr), rootErr)
+-		case strings.Contains(errStr, "no such host"):
+-			return withRootCause(errors.Newf("unable to resolve host '%s'", parsedURL.Hostname()).
+-				WithCode(errors.CodeBadRequest).
+-				WithHint("Check if the hostname is spelled correctly and that DNS is working"), rootErr)
+-		case strings.Contains(errStr, "connection refused"):
+-			hint := fmt.Sprintf(`The server at %s refused the connection. To resolve this:
+-1. Ensure the server is running
+-2. Check if the port is correct
+-3. Verify firewall settings allow the connection
+-4. If using localhost, ensure the service is bound to the correct interface`, host)
+-
+-			return withRootCause(errors.Newf("connection refused by server at %s", host).
+-				WithCode(errors.CodeServiceUnavailable).
+-				WithHint(hint), rootErr)
+-		}
+-	}
+-
+-	// Check for net.Error
++	if !stderrors.As(err, &urlErr) {
++		return nil, err
++	}
++	if urlErr.Timeout() {
++		e := h.add(errors.Newf("connection to %s timed out", h.host).
++			WithCode(errors.CodeTimeout).
++			WithHint("Try increasing the timeout, check your network connection, or verify the server is responding"))
++		return withRootCause(e, rootErr), nil
++	}
++
++	return nil, urlErr.Err
++}
++
++func handleDNSError(err error, h hostDetails, rootErr string) *errors.Error {
++	var dnsErr *net.DNSError
++	if !stderrors.As(err, &dnsErr) {
++		return nil
++	}
++
++	hint := "DNS lookup failed. Check if the hostname is spelled correctly and that DNS is working."
++	if dnsErr.IsTimeout {
++		hint = "DNS lookup timed out. Check network connectivity or try a different DNS resolver."
++	} else if dnsErr.IsTemporary {
++		hint = "DNS lookup is temporarily failing. Retry or switch networks."
++	}
++	dnsMsg := dnsErr.Name
++	if dnsMsg == "" {
++		dnsMsg = h.hostname
++	}
++
++	e := h.add(errors.Newf("unable to resolve host '%s'", dnsMsg).
++		WithCode(errors.CodeBadRequest).
++		WithHint(hint))
++	if dnsErr.Err != "" {
++		e = e.WithDetail("dns_error", dnsErr.Err)
++	}
++	if dnsErr.Server != "" {
++		e = e.WithDetail("dns_server", dnsErr.Server)
++	}
++
++	return withRootCause(e, rootErr)
++}
++
++func connectionRefusedHint(host string) string {
++	return fmt.Sprintf(
++		"The server at %s refused the connection. To resolve this:\n"+
++			"1. Ensure the server is running\n"+
++			"2. Check if the port is correct\n"+
++			"3. Verify firewall settings allow the connection\n"+
++			"4. If using a proxy/VPN, try disabling it\n"+
++			"5. On dual-stack networks, try forcing IPv4 if supported by the client",
++		host,
++	)
++}
++
++func handleDialSyscall(sysErr *os.SyscallError, h hostDetails, rootErr string, addr net.Addr) *errors.Error {
++	switch {
++	case stderrors.Is(sysErr.Err, syscall.ECONNREFUSED):
++		e := addDialDetails(errors.Newf("connection refused by server at %s", h.host).
++			WithCode(errors.CodeServiceUnavailable).
++			WithHint(connectionRefusedHint(h.host)), h, sysErr, addr)
++		return withRootCause(e, rootErr)
++	case stderrors.Is(sysErr.Err, syscall.ENETUNREACH),
++		stderrors.Is(sysErr.Err, syscall.EHOSTUNREACH):
++		e := addDialDetails(errors.Newf("network unreachable while connecting to %s", h.host).
++			WithCode(errors.CodeNetworkError).
++			WithHint("Network is unreachable. Check your Wi-Fi/LTE connection or VPN settings"), h, sysErr, addr)
++		return withRootCause(e, rootErr)
++	case stderrors.Is(sysErr.Err, syscall.EADDRNOTAVAIL):
++		e := addDialDetails(errors.Newf("local address not available while connecting to %s", h.host).
++			WithCode(errors.CodeNetworkError).
++			WithHint("Local address is not available. Check your network interfaces or VPN configuration"), h, sysErr, addr)
++		return withRootCause(e, rootErr)
++	case stderrors.Is(sysErr.Err, syscall.ETIMEDOUT):
++		e := addDialDetails(errors.Newf("connection to %s timed out", h.host).
++			WithCode(errors.CodeTimeout).
++			WithHint("The connection timed out. Check network connectivity or try again"), h, sysErr, addr)
++		return withRootCause(e, rootErr)
++	default:
++		return nil
 +	}
 +}
 +
-+func withRootCause(err *errors.Error, root string) *errors.Error {
-+	if root != "" {
-+		err = err.WithDetail("root_error", root)
++func handleDialError(err error, h hostDetails, rootErr string) *errors.Error {
++	var opErr *net.OpError
++	if !stderrors.As(err, &opErr) || opErr.Op != "dial" {
++		return nil
++	}
++
++	if sysErr, ok := opErr.Err.(*os.SyscallError); ok {
++		if handled := handleDialSyscall(sysErr, h, rootErr, opErr.Addr); handled != nil {
++			return handled
++		}
++	}
++
++	e := addDialDetails(errors.Newf("failed to establish connection to %s", h.host).
++		WithCode(errors.CodeServiceUnavailable).
++		WithHint("The server might be down or unreachable. Check network connectivity and server status"), h, nil, opErr.Addr)
++	return withRootCause(e, rootErr)
++}
++
++func handleNetError(err error, h hostDetails, rootErr string) *errors.Error {
+ 	var netErr net.Error
+-	if stderrors.As(err, &netErr) {
+-		if netErr.Timeout() {
+-			return withRootCause(errors.Newf("network operation timed out while connecting to %s", host).
+-				WithCode(errors.CodeTimeout).
+-				WithHint("This might be due to network issues or an unresponsive server"), rootErr)
+-		}
+-
+-		// Check for specific network operation errors
+-		if opErr, ok := netErr.(*net.OpError); ok {
+-			if opErr.Op == "dial" {
+-				return withRootCause(errors.Newf("failed to establish connection to %s", host).
+-					WithCode(errors.CodeServiceUnavailable).
+-					WithHint("The server might be down or unreachable. Check network connectivity and server status"), rootErr)
+-			}
+-		}
+-	}
+-
+-	// Check for common error patterns in error string
++	if !stderrors.As(err, &netErr) {
++		return nil
++	}
++
++	if netErr.Timeout() {
++		e := h.add(errors.Newf("network operation timed out while connecting to %s", h.host).
++			WithCode(errors.CodeTimeout).
++			WithHint("This might be due to network issues or an unresponsive server"))
++		return withRootCause(e, rootErr)
++	}
++
++	if opErr, ok := netErr.(*net.OpError); ok && opErr.Op == "dial" {
++		e := h.add(errors.Newf("failed to establish connection to %s", h.host).
++			WithCode(errors.CodeServiceUnavailable).
++			WithHint("The server might be down or unreachable. Check network connectivity and server status"))
++		return withRootCause(e, rootErr)
++	}
++
++	return nil
++}
++
++func handleErrorStringPatterns(err error, h hostDetails, parsedURL *url.URL, rootErr string) *errors.Error {
+ 	errStr := err.Error()
+ 	switch {
++	case strings.Contains(errStr, "proxyconnect"):
++		e := h.add(errors.Newf("proxy connection failed while reaching %s", h.host).
++			WithCode(errors.CodeServiceUnavailable).
++			WithHint("Check HTTP_PROXY/HTTPS_PROXY/NO_PROXY environment variables and proxy availability").
++			WithDetail("proxy_error", errStr))
++		return withRootCause(e, rootErr)
++	case strings.Contains(errStr, "no such host"):
++		hostname := parsedURL.Hostname()
++		if hostname == "" {
++			hostname = h.hostname
++		}
++		e := h.add(errors.Newf("unable to resolve host '%s'", hostname).
++			WithCode(errors.CodeBadRequest).
++			WithHint("Check if the hostname is spelled correctly and that DNS is working"))
++		return withRootCause(e, rootErr)
++	case strings.Contains(errStr, "connection refused"):
++		e := h.add(errors.Newf("connection refused by server at %s", h.host).
++			WithCode(errors.CodeServiceUnavailable).
++			WithHint(connectionRefusedHint(h.host)))
++		return withRootCause(e, rootErr)
+ 	case strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline exceeded"):
+-		return withRootCause(errors.Newf("request to %s timed out", host).
++		e := h.add(errors.Newf("request to %s timed out", h.host).
+ 			WithCode(errors.CodeTimeout).
+-			WithHint("The operation took too long. Consider increasing the timeout or checking server performance"), rootErr)
++			WithHint("The operation took too long. Consider increasing the timeout or checking server performance"))
++		return withRootCause(e, rootErr)
+ 	case strings.Contains(errStr, "connection reset"):
+-		return withRootCause(errors.Newf("connection to %s was reset by the server", host).
++		e := h.add(errors.Newf("connection to %s was reset by the server", h.host).
+ 			WithCode(errors.CodeServiceUnavailable).
+-			WithHint("The server closed the connection unexpectedly. This might indicate a server issue or network problem"), rootErr)
++			WithHint("The server closed the connection unexpectedly. This might indicate a server issue or network problem"))
++		return withRootCause(e, rootErr)
+ 	case strings.Contains(errStr, "broken pipe"):
+-		return withRootCause(errors.Newf("connection to %s was broken during data transfer", host).
++		e := h.add(errors.Newf("connection to %s was broken during data transfer", h.host).
+ 			WithCode(errors.CodeNetworkError).
+-			WithHint("The connection was interrupted. "+
+-				"This often happens when the server closes the connection while data is being sent"), rootErr)
++			WithHint("The connection was interrupted. " +
++				"This often happens when the server closes the connection while data is being sent"))
++		return withRootCause(e, rootErr)
+ 	case strings.Contains(errStr, "certificate") || strings.Contains(errStr, "x509"):
+-		return withRootCause(errors.Newf("TLS certificate validation failed for %s", host).
++		e := h.add(errors.Newf("TLS certificate validation failed for %s", h.host).
+ 			WithCode(errors.CodeBadRequest).
+-			WithHint("The server's certificate is invalid or untrusted. Verify the certificate or use proper CA certificates"), rootErr)
++			WithHint("The server's certificate is invalid or untrusted. Verify the certificate or use proper CA certificates"))
++		return withRootCause(e, rootErr)
+ 	default:
+-		// Generic network error
+-		return withRootCause(errors.Newf("network error occurred while connecting to %s: %v", host, err).
++		e := h.add(errors.Newf("network error occurred while connecting to %s: %v", h.host, err).
+ 			WithCode(errors.CodeNetworkError).
+-			WithHint("Check your network connection and try again"), rootErr)
++			WithHint("Check your network connection and try again"))
++		return withRootCause(e, rootErr)
  	}
-+	return err
  }
-diff --git a/shared/http/errors_test.go b/shared/http/errors_test.go
-index d58a04c6..1d75d76b 100644
---- a/shared/http/errors_test.go
-+++ b/shared/http/errors_test.go
-@@ -87,6 +87,7 @@ func TestTransformError_NetworkError(t *testing.T) {
- 	assert.Equal(t, "HTTPClient", err.Component)
- 	assert.Equal(t, "http://invalid-domain-that-does-not-exist-12345.com", err.Details["url"])
- 	assert.Equal(t, "GET", err.Details["method"])
-+	assert.NotEmpty(t, err.Details["root_error"])
- 	assert.Contains(t, err.Message, "unable to resolve host")
- 	assert.Contains(t, err.Hint, "Check if the hostname is spelled correctly")
- }
-@@ -160,6 +161,7 @@ func TestTransformError_ConnectionRefused(t *testing.T) {
- 	require.NotNil(t, err)
- 	assert.Equal(t, errors.CodeServiceUnavailable, err.Code)
- 	assert.Equal(t, "HTTPClient", err.Component)
-+	assert.NotEmpty(t, err.Details["root_error"])
- 	assert.Contains(t, err.Message, "connection refused")
- 	assert.Contains(t, err.Hint, "Ensure the server is running")
- }
++
++// handleNetworkError categorizes network errors more precisely
++func handleNetworkError(err error, reqURL string) *errors.Error {
++	rootErr := err.Error()
++	h, parsedURL := parseHostDetails(reqURL)
++
++	if handled, unwrapped := unwrapURLError(err, h, rootErr); handled != nil {
++		return handled
++	} else {
++		err = unwrapped
++	}
++
++	if handled := handleDNSError(err, h, rootErr); handled != nil {
++		return handled
++	}
++	if handled := handleDialError(err, h, rootErr); handled != nil {
++		return handled
++	}
++	if handled := handleNetError(err, h, rootErr); handled != nil {
++		return handled
++	}
++
++	return handleErrorStringPatterns(err, h, parsedURL, rootErr)
++}

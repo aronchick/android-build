@@ -1,0 +1,477 @@
+diff --git a/shared/bootstrap/client.go b/shared/bootstrap/client.go
+index 81d8c3b1..d6c2fc6f 100644
+--- a/shared/bootstrap/client.go
++++ b/shared/bootstrap/client.go
+@@ -2,7 +2,10 @@ package bootstrap
+ 
+ import (
+ 	"context"
++	stderrors "errors"
+ 	"fmt"
++	"net/http"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/expanso-io/expanso/lib/errors"
+@@ -34,6 +37,8 @@ func getContextDeadline(ctx context.Context) string {
+ // Client handles communication with the bootstrap service
+ type Client struct {
+ 	http *req.Client
++	base string
++	diag diagnosticsConfig
+ }
+ 
+ // ClientConfig contains configuration for the bootstrap client
+@@ -96,6 +101,13 @@ func NewClient(config ClientConfig) (*Client, error) {
+ 
+ 	return &Client{
+ 		http: httpClient,
++		base: config.BaseURL,
++		diag: diagnosticsConfig{
++			disableProxy:       config.DisableProxy,
++			forceIPv4:          config.ForceIPv4,
++			insecureSkipVerify: config.InsecureSkipVerify,
++			timeout:            config.Timeout,
++		},
+ 	}, nil
+ }
+ 
+@@ -110,6 +122,9 @@ func (c *Client) Bootstrap(ctx context.Context, req *BootstrapRequest) (*Bootstr
+ 		Post("/api/v1/register")
+ 
+ 	if err != nil {
++		if enhanced := c.enhanceBootstrapError(ctx, err); enhanced != nil {
++			return nil, enhanced
++		}
+ 		return nil, fmt.Errorf("bootstrap request failed: %w", err)
+ 	}
+ 	// Validate response
+@@ -134,3 +149,79 @@ func (c *Client) Bootstrap(ctx context.Context, req *BootstrapRequest) (*Bootstr
+ 
+ 	return &response, nil
+ }
++
++func (c *Client) enhanceBootstrapError(ctx context.Context, err error) error {
++	var structuredErr *errors.Error
++	if !stderrors.As(err, &structuredErr) {
++		return nil
++	}
++
++	switch structuredErr.HTTPStatus {
++	case http.StatusUnauthorized:
++		return structuredErr.Copy().WithHint(
++			"Bootstrap token is invalid or expired. " +
++				"Generate a new token in https://cloud.expanso.io and try again.",
++		)
++	case http.StatusForbidden:
++		return structuredErr.Copy().WithHint(
++			"Bootstrap token is not authorized for this workspace. " +
++				"Generate a new token in https://cloud.expanso.io and try again.",
++		)
++	}
++
++	if isNetworkBootstrapError(structuredErr) {
++		enhanced := structuredErr.Copy()
++		if structuredErr.Code == errors.CodeServiceUnavailable &&
++			strings.Contains(strings.ToLower(structuredErr.Message), "connection refused") {
++			hint := enhanced.Hint
++			if hint != "" {
++				hint += "\n\n"
++			}
++			hint += "If this endpoint is known to be up, check local network/proxy settings and try forcing IPv4 if supported. " +
++				"For diagnostics, run: curl -4 -v <bootstrap_url>/api/v1/register with the same token."
++			enhanced = enhanced.WithHint(hint)
++		}
++
++		diagCtx := ctx
++		if diagCtx == nil || diagCtx.Err() != nil {
++			diagCtx = context.Background()
++		}
++		diagnostics := runBootstrapDiagnostics(diagCtx, c.base, c.diag)
++		return appendDiagnostics(enhanced, diagnostics)
++	}
++
++	return structuredErr
++}
++
++func isNetworkBootstrapError(err *errors.Error) bool {
++	if err == nil {
++		return false
++	}
++	if err.Code == errors.CodeRequestCancelled {
++		return false
++	}
++	if err.Details == nil {
++		return false
++	}
++	return err.Details["root_error"] != ""
++}
++
++func appendDiagnostics(err *errors.Error, diagnostics diagnosticResult) *errors.Error {
++	if err == nil || len(diagnostics.lines) == 0 {
++		return err
++	}
++
++	hint := diagnostics.hint()
++	if hint != "" {
++		if err.Hint != "" {
++			hint = err.Hint + "\n\n" + hint
++		}
++		err = err.WithHint(hint)
++	}
++
++	for key, value := range diagnostics.details {
++		err = err.WithDetail(key, value)
++	}
++
++	return err
++}
+ diff --git a/shared/bootstrap/diagnostics.go b/shared/bootstrap/diagnostics.go
+new file mode 100644
+index 00000000..e5cdf6e9
+--- /dev/null
++++ b/shared/bootstrap/diagnostics.go
+@@ -0,0 +1,343 @@
++package bootstrap
++
++import (
++	"context"
++	"crypto/tls"
++	"fmt"
++	"net"
++	"net/http"
++	"net/url"
++	"strings"
++	"time"
++)
++
++type diagnosticsConfig struct {
++	disableProxy       bool
++	forceIPv4          bool
++	insecureSkipVerify bool
++	timeout            time.Duration
++}
++
++const schemeHTTPS = "https"
++
++type diagnosticTarget struct {
++	url    *url.URL
++	host   string
++	port   string
++	scheme string
++}
++
++type diagnosticResult struct {
++	lines   []string
++	details map[string]string
++}
++
++func newDiagnosticResult() diagnosticResult {
++	return diagnosticResult{
++		details: make(map[string]string),
++	}
++}
++
++func (r *diagnosticResult) add(label, status string) {
++	if status == "" {
++		return
++	}
++	line := fmt.Sprintf("%s: %s", label, status)
++	r.lines = append(r.lines, line)
++
++	key := "diagnostic_" + strings.ToLower(strings.ReplaceAll(label, " ", "_"))
++	r.details[key] = status
++}
++
++func (r diagnosticResult) hint() string {
++	if len(r.lines) == 0 {
++		return ""
++	}
++
++	var b strings.Builder
++	b.WriteString("Diagnostics:\n")
++	for _, line := range r.lines {
++		b.WriteString("- ")
++		b.WriteString(line)
++		b.WriteString("\n")
++	}
++	return strings.TrimSpace(b.String())
++}
++
++func runBootstrapDiagnostics(ctx context.Context, baseURL string, cfg diagnosticsConfig) diagnosticResult {
++	result := newDiagnosticResult()
++
++	target, err := parseDiagnosticTarget(baseURL)
++	if err != nil {
++		result.add("URL", fmt.Sprintf("invalid (%v)", err))
++		return result
++	}
++
++	proxyStatus, proxyURL := proxyDescription(target.url, cfg.disableProxy)
++	result.add("Proxy", proxyStatus)
++
++	timeout := diagnosticsTimeout(cfg.timeout)
++	diagCtx, cancel := context.WithTimeout(ctx, timeout)
++	defer cancel()
++
++	ips, dnsStatus, dnsOK := resolveHost(diagCtx, target.host, cfg.forceIPv4)
++	result.add("DNS", dnsStatus)
++	if !dnsOK {
++		result.add("TCP", "skipped (dns failed)")
++		if target.scheme == schemeHTTPS {
++			result.add("TLS", "skipped (dns failed)")
++		}
++		return result
++	}
++
++	if proxyURL != nil {
++		proxyTCP := probeTCP(diagCtx, proxyURL, cfg.forceIPv4, timeout)
++		if proxyTCP != "" {
++			result.add("Proxy TCP", proxyTCP)
++		}
++	}
++
++	conn, tcpStatus, tcpOK := dialTarget(diagCtx, ips[0], target.port, cfg.forceIPv4, timeout)
++	result.add("TCP", tcpStatus)
++	if !tcpOK {
++		if target.scheme == schemeHTTPS {
++			result.add("TLS", "skipped (tcp failed)")
++		}
++		return result
++	}
++	defer func() {
++		_ = conn.Close()
++	}()
++
++	if target.scheme == schemeHTTPS {
++		tlsStatus, tlsOK := probeTLS(diagCtx, conn, target.host, cfg.insecureSkipVerify, timeout)
++		result.add("TLS", tlsStatus)
++		if !tlsOK {
++			return result
++		}
++	}
++
++	return result
++}
++
++func parseDiagnosticTarget(baseURL string) (diagnosticTarget, error) {
++	parsed, err := url.Parse(baseURL)
++	if err != nil {
++		return diagnosticTarget{}, err
++	}
++	if parsed.Scheme == "" {
++		return diagnosticTarget{}, fmt.Errorf("missing URL scheme")
++	}
++	host := parsed.Hostname()
++	if host == "" {
++		return diagnosticTarget{}, fmt.Errorf("missing host")
++	}
++	port := parsed.Port()
++	if port == "" {
++		port = defaultPort(parsed.Scheme)
++	}
++	if port == "" {
++		return diagnosticTarget{}, fmt.Errorf("unsupported scheme %q", parsed.Scheme)
++	}
++
++	return diagnosticTarget{
++		url:    parsed,
++		host:   host,
++		port:   port,
++		scheme: parsed.Scheme,
++	}, nil
++}
++
++func defaultPort(scheme string) string {
++	switch strings.ToLower(scheme) {
++	case schemeHTTPS:
++		return "443"
++	case "http":
++		return "80"
++	default:
++		return ""
++	}
++}
++
++func diagnosticsTimeout(configured time.Duration) time.Duration {
++	const maxTimeout = 3 * time.Second
++	if configured <= 0 || configured > maxTimeout {
++		return maxTimeout
++	}
++	return configured
++}
++
++func proxyDescription(target *url.URL, disableProxy bool) (string, *url.URL) {
++	if disableProxy {
++		return "disabled by config", nil
++	}
++	if target == nil {
++		return "unknown", nil
++	}
++
++	proxyURL, err := http.ProxyFromEnvironment(&http.Request{URL: target})
++	if err != nil {
++		return fmt.Sprintf("error (%v)", err), nil
++	}
++	if proxyURL == nil {
++		return "none", nil
++	}
++
++	return fmt.Sprintf("using %s", sanitizeProxyURL(proxyURL)), proxyURL
++}
++
++func sanitizeProxyURL(proxyURL *url.URL) string {
++	if proxyURL == nil {
++		return ""
++	}
++	clean := *proxyURL
++	if clean.User != nil {
++		clean.User = url.User(clean.User.Username())
++	}
++	return clean.String()
++}
++
++func resolveHost(ctx context.Context, host string, forceIPv4 bool) ([]net.IP, string, bool) {
++	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
++	if err != nil {
++		return nil, fmt.Sprintf("failed (%v)", err), false
++	}
++
++	ips := make([]net.IP, 0, len(addrs))
++	for _, addr := range addrs {
++		ips = append(ips, addr.IP)
++	}
++
++	if forceIPv4 {
++		ipv4 := filterIPv4(ips)
++		if len(ipv4) == 0 {
++			return nil, "failed (no IPv4 records)", false
++		}
++		ips = ipv4
++	}
++
++	return ips, fmt.Sprintf("ok (%s)", summarizeIPs(ips)), true
++}
++
++func filterIPv4(ips []net.IP) []net.IP {
++	filtered := make([]net.IP, 0, len(ips))
++	for _, ip := range ips {
++		if ip.To4() != nil {
++			filtered = append(filtered, ip)
++		}
++	}
++	return filtered
++}
++
++func summarizeIPs(ips []net.IP) string {
++	if len(ips) == 0 {
++		return "none"
++	}
++	const maxShown = 3
++	parts := make([]string, 0, maxShown+1)
++	for i, ip := range ips {
++		if i >= maxShown {
++			parts = append(parts, "...")
++			break
++		}
++		parts = append(parts, ip.String())
++	}
++	return strings.Join(parts, ", ")
++}
++
++func probeTCP(ctx context.Context, proxyURL *url.URL, forceIPv4 bool, timeout time.Duration) string {
++	if proxyURL == nil {
++		return ""
++	}
++
++	host := proxyURL.Hostname()
++	if host == "" {
++		return "skipped (proxy host missing)"
++	}
++	port := proxyURL.Port()
++	if port == "" {
++		port = defaultPort(proxyURL.Scheme)
++		if port == "" {
++			port = "80"
++		}
++	}
++
++	address := net.JoinHostPort(host, port)
++	network := "tcp"
++	if forceIPv4 {
++		network = "tcp4"
++	}
++
++	dialer := net.Dialer{Timeout: timeout}
++	start := time.Now()
++	conn, err := dialer.DialContext(ctx, network, address)
++	if err != nil {
++		return fmt.Sprintf("failed (%v)", err)
++	}
++	_ = conn.Close()
++
++	return fmt.Sprintf("ok (%s in %s)", address, time.Since(start).Truncate(time.Millisecond))
++}
++
++func dialTarget(ctx context.Context, ip net.IP, port string, forceIPv4 bool, timeout time.Duration) (net.Conn, string, bool) {
++	if ip == nil {
++		return nil, "skipped (no IP)", false
++	}
++	address := net.JoinHostPort(ip.String(), port)
++
++	network := "tcp"
++	if forceIPv4 {
++		network = "tcp4"
++	}
++
++	dialer := net.Dialer{Timeout: timeout}
++	start := time.Now()
++	conn, err := dialer.DialContext(ctx, network, address)
++	if err != nil {
++		return nil, fmt.Sprintf("failed (%v)", err), false
++	}
++
++	return conn, fmt.Sprintf("ok (%s in %s)", address, time.Since(start).Truncate(time.Millisecond)), true
++}
++
++func probeTLS(ctx context.Context, conn net.Conn, host string, insecure bool, timeout time.Duration) (string, bool) {
++	if conn == nil {
++		return "skipped (no connection)", false
++	}
++
++	// #nosec G402 -- diagnostic only, respects config for insecure environments
++	tlsConn := tls.Client(conn, &tls.Config{
++		ServerName:         host,
++		InsecureSkipVerify: insecure,
++	})
++	_ = tlsConn.SetDeadline(time.Now().Add(timeout))
++
++	if err := tlsConn.HandshakeContext(ctx); err != nil {
++		_ = tlsConn.Close()
++		return fmt.Sprintf("failed (%v)", err), false
++	}
++
++	state := tlsConn.ConnectionState()
++	_ = tlsConn.Close()
++
++	version := tlsVersionName(state.Version)
++	if insecure {
++		return fmt.Sprintf("ok (%s, verification disabled)", version), true
++	}
++	return fmt.Sprintf("ok (%s)", version), true
++}
++
++func tlsVersionName(version uint16) string {
++	switch version {
++	case tls.VersionTLS10:
++		return "TLS1.0"
++	case tls.VersionTLS11:
++		return "TLS1.1"
++	case tls.VersionTLS12:
++		return "TLS1.2"
++	case tls.VersionTLS13:
++		return "TLS1.3"
++	default:
++		return "TLS"
++	}
++}
