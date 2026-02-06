@@ -73,40 +73,33 @@ choose_install_dir() {
 
 choose_install_dir
 
-if [ "$VERSION" = "latest" ]; then
-  release_api="https://api.github.com/repos/${REPO}/releases/latest"
-else
-  release_api="https://api.github.com/repos/${REPO}/releases/tags/${VERSION}"
-fi
-
-if [ -n "$TOKEN" ]; then
-  json="$(curl -fsSL -H "Authorization: token ${TOKEN}" "$release_api")"
-else
-  json="$(curl -fsSL "$release_api")"
-fi
 asset_name="${BINARY_NAME}-android-${arch}"
-# Best-effort JSON parse without extra tools (line-based on GitHub's pretty JSON).
-asset_url="$(printf '%s\n' "$json" | awk -F'"' -v name="$asset_name" '
-  $2 == "name" && $4 == name { found=1; next }
-  found && $2 == "browser_download_url" { print $4; exit }
-')"
 
-if [ -z "$asset_url" ]; then
-  message="$(printf '%s\n' "$json" | awk -F'"' '$2 == "message" { print $4; exit }')"
-  if [ -n "$message" ]; then
-    echo "GitHub API error: $message" >&2
-  fi
-  echo "Error: release asset not found for ${asset_name} (version: ${VERSION})." >&2
-  exit 1
+if [ "$VERSION" = "latest" ]; then
+  asset_url="https://github.com/${REPO}/releases/latest/download/${asset_name}"
+else
+  case "$VERSION" in
+    v*) tag="$VERSION" ;;
+    *) tag="v${VERSION}" ;;
+  esac
+  asset_url="https://github.com/${REPO}/releases/download/${tag}/${asset_name}"
 fi
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 if [ -n "$TOKEN" ]; then
-  curl -fL -H "Authorization: token ${TOKEN}" -o "$tmp_dir/${BINARY_NAME}" "$asset_url"
+  if ! curl -fLS -H "Authorization: token ${TOKEN}" -o "$tmp_dir/${BINARY_NAME}" "$asset_url"; then
+    echo "Error: download failed for ${asset_name} (version: ${VERSION})." >&2
+    echo "Check that the release exists and the asset is published." >&2
+    exit 1
+  fi
 else
-  curl -fL -o "$tmp_dir/${BINARY_NAME}" "$asset_url"
+  if ! curl -fLS -o "$tmp_dir/${BINARY_NAME}" "$asset_url"; then
+    echo "Error: download failed for ${asset_name} (version: ${VERSION})." >&2
+    echo "Check that the release exists and the asset is published." >&2
+    exit 1
+  fi
 fi
 chmod +x "$tmp_dir/${BINARY_NAME}"
 
