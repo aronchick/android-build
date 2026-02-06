@@ -1,0 +1,3 @@
+[submodule "expanso"]
+	path = expanso
+	url = git@github.com:aronchick/expanso.git

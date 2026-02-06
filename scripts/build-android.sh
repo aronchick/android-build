@@ -4,7 +4,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PATCH_DIR="$ROOT_DIR/patches"
 
-REPO_URL="${EXPANSO_REPO:-https://github.com/expanso-io/expanso.git}"
 REF="${EXPANSO_REF:-main}"
 VERSION="${EXPANSO_VERSION:-}"
 OUT_DIR="${EXPANSO_OUT_DIR:-$ROOT_DIR/dist}"
@@ -15,7 +14,6 @@ usage() {
 Usage: $0 [--ref REF] [--version VERSION] [--out-dir DIR]
 
 Environment overrides:
-  EXPANSO_REPO    Repo URL (default: $REPO_URL)
   EXPANSO_REF     Git ref (default: $REF)
   EXPANSO_VERSION Version string (default: dev-android-<shortsha>)
   EXPANSO_OUT_DIR Output directory (default: $OUT_DIR)
@@ -54,40 +52,29 @@ else
 fi
 export GOMODCACHE="$MODCACHE_DIR"
 
-SRC_DIR="$WORK_DIR/expanso"
+SRC_DIR="$ROOT_DIR/expanso"
 
-clone_repo() {
-  local url="$1"
-  local ref="$2"
-  local dest="$3"
-  local depth_args=(--depth 1 --filter=blob:none)
-
-  if [[ -n "$ref" ]]; then
-    depth_args+=(--branch "$ref")
+ensure_submodule() {
+  if [[ ! -f "$ROOT_DIR/.gitmodules" ]]; then
+    echo "Missing .gitmodules. Initialize the expanso submodule first." >&2
+    exit 1
   fi
-
-  if ! git clone "${depth_args[@]}" "$url" "$dest" >/dev/null 2>&1; then
-    git clone "$url" "$dest" >/dev/null 2>&1
+  if [[ ! -d "$SRC_DIR/.git" ]]; then
+    echo "Expanso submodule not found. Initializing..." >&2
+    git submodule update --init --recursive expanso
   fi
 }
 
-if [[ -d "$REPO_URL/.git" ]]; then
-  clone_repo "$REPO_URL" "$REF" "$SRC_DIR"
-else
-  if [[ "$REPO_URL" == https://github.com/* ]] && [[ -n "${GITHUB_TOKEN:-${GH_TOKEN:-}}" ]]; then
-    token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-    auth_url="${REPO_URL/https:\/\/github.com\//https:\/\/${token}:x-oauth-basic@github.com/}"
-    clone_repo "$auth_url" "$REF" "$SRC_DIR"
-  else
-    clone_repo "$REPO_URL" "$REF" "$SRC_DIR"
-  fi
-fi
+ensure_submodule
 cd "$SRC_DIR"
 
-if git rev-parse --verify "$REF" >/dev/null 2>&1; then
-  git checkout -q "$REF"
-else
-  git checkout -q "origin/$REF" || git checkout -q "$REF"
+if [[ -n "$REF" ]]; then
+  git fetch --all --prune >/dev/null 2>&1 || true
+  if git rev-parse --verify "$REF" >/dev/null 2>&1; then
+    git checkout -q "$REF"
+  else
+    git checkout -q "origin/$REF" || git checkout -q "$REF"
+  fi
 fi
 
 COMMIT="$(git rev-parse --short=12 HEAD)"
