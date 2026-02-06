@@ -1,0 +1,256 @@
+diff --git a/edge/cmd/commands/bootstrap.go b/edge/cmd/commands/bootstrap.go
+index b8774ff..94dde03 100644
+--- a/edge/cmd/commands/bootstrap.go
++++ b/edge/cmd/commands/bootstrap.go
+@@ -133,6 +133,7 @@ func runBootstrap(cmd *cobra.Command, cfg *bootstrapConfig) error {
+ 	slog.Info("Bootstrapping edge node to Expanso Cloud", "data_dir", currentCfg.DataDir)
+ 
+ 	// Perform bootstrap
++	verbose := utils.GetVerbose(cmd.Context())
+ 	token := flags.ResolveBootstrapToken(cfg.BootstrapToken)
+ 	url := flags.ResolveBootstrapURL(cfg.BootstrapURL)
+ 	insecure := flags.ResolveBootstrapInsecure(cfg.Insecure)
+@@ -145,6 +146,7 @@ func runBootstrap(cmd *cobra.Command, cfg *bootstrapConfig) error {
+ 		Insecure:     insecure,
+ 		DisableProxy: disableProxy,
+ 		ForceIPv4:    forceIPv4,
++		Verbose:      verbose,
+ 	})
+ 	if err != nil {
+ 		// Handle already bootstrapped case gracefully
+diff --git a/edge/cmd/commands/run.go b/edge/cmd/commands/run.go
+index 802c32b..0ee9201 100644
+--- a/edge/cmd/commands/run.go
++++ b/edge/cmd/commands/run.go
+@@ -96,6 +96,7 @@ func runServiceDirectly(cmd *cobra.Command, cfg *flags.ServiceRunConfig) error {
+ 		return err
+ 	}
+ 
++	verbose, _ := cmd.Flags().GetBool("verbose")
+ 	if err = ensureRegistered(
+ 		ctx,
+ 		cfg.GetBootstrapToken(),
+@@ -103,6 +104,7 @@ func runServiceDirectly(cmd *cobra.Command, cfg *flags.ServiceRunConfig) error {
+ 		cfg.GetBootstrapInsecure(),
+ 		cfg.GetBootstrapNoProxy(),
+ 		cfg.GetBootstrapForceIPv4(),
++		verbose,
+ 		configManager,
+ 	); err != nil {
+ 		return err
+@@ -165,6 +167,7 @@ func runWithSupervisor(cmd *cobra.Command, cfg *flags.ServiceRunConfig) error {
+ 		return err
+ 	}
+ 
++	verbose, _ := cmd.Flags().GetBool("verbose")
+ 	if err = ensureRegistered(
+ 		ctx,
+ 		cfg.GetBootstrapToken(),
+@@ -172,6 +175,7 @@ func runWithSupervisor(cmd *cobra.Command, cfg *flags.ServiceRunConfig) error {
+ 		cfg.GetBootstrapInsecure(),
+ 		cfg.GetBootstrapNoProxy(),
+ 		cfg.GetBootstrapForceIPv4(),
++		verbose,
+ 		configManager,
+ 	); err != nil {
+ 		return err
+@@ -238,6 +242,7 @@ func ensureRegistered(
+ 	insecure bool,
+ 	disableProxy bool,
+ 	forceIPv4 bool,
++	verbose bool,
+ 	configManager interfaces.EdgeConfigManager,
+ ) error {
+ 	// If explicit local mode, skip bootstrap
+@@ -253,6 +258,7 @@ func ensureRegistered(
+ 		Insecure:     insecure,
+ 		DisableProxy: disableProxy,
+ 		ForceIPv4:    forceIPv4,
++		Verbose:      verbose,
+ 	})
+ 	if err != nil {
+ 		return errors.Wrap(err, "failed to connect edge node")
+diff --git a/shared/bootstrap/client.go b/shared/bootstrap/client.go
+index 81d8c3b..2eab5ca 100644
+--- a/shared/bootstrap/client.go
++++ b/shared/bootstrap/client.go
+@@ -2,7 +2,10 @@ package bootstrap
+ 
+ import (
+ 	"context"
++	stderrors "errors"
+ 	"fmt"
++	"net/http"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/expanso-io/expanso/lib/errors"
+@@ -34,6 +37,8 @@ func getContextDeadline(ctx context.Context) string {
+ // Client handles communication with the bootstrap service
+ type Client struct {
+ 	http *req.Client
++	base string
++	diag diagnosticsConfig
+ }
+ 
+ // ClientConfig contains configuration for the bootstrap client
+@@ -96,6 +101,14 @@ func NewClient(config ClientConfig) (*Client, error) {
+ 
+ 	return &Client{
+ 		http: httpClient,
++		base: config.BaseURL,
++		diag: diagnosticsConfig{
++			enabled:            config.Debug,
++			disableProxy:       config.DisableProxy,
++			forceIPv4:          config.ForceIPv4,
++			insecureSkipVerify: config.InsecureSkipVerify,
++			timeout:            config.Timeout,
++		},
+ 	}, nil
+ }
+ 
+@@ -110,6 +123,9 @@ func (c *Client) Bootstrap(ctx context.Context, req *BootstrapRequest) (*Bootstr
+ 		Post("/api/v1/register")
+ 
+ 	if err != nil {
++		if enhanced := c.enhanceBootstrapError(ctx, err); enhanced != nil {
++			return nil, enhanced
++		}
+ 		return nil, fmt.Errorf("bootstrap request failed: %w", err)
+ 	}
+ 	// Validate response
+@@ -134,3 +150,82 @@ func (c *Client) Bootstrap(ctx context.Context, req *BootstrapRequest) (*Bootstr
+ 
+ 	return &response, nil
+ }
++
++func (c *Client) enhanceBootstrapError(ctx context.Context, err error) error {
++	var structuredErr *errors.Error
++	if !stderrors.As(err, &structuredErr) {
++		return nil
++	}
++	if !c.diag.enabled {
++		return nil
++	}
++
++	switch structuredErr.HTTPStatus {
++	case http.StatusUnauthorized:
++		return structuredErr.Copy().WithHint(
++			"Bootstrap token is invalid or expired. " +
++				"Generate a new token in https://cloud.expanso.io and try again.",
++		)
++	case http.StatusForbidden:
++		return structuredErr.Copy().WithHint(
++			"Bootstrap token is not authorized for this workspace. " +
++				"Generate a new token in https://cloud.expanso.io and try again.",
++		)
++	}
++
++	if isNetworkBootstrapError(structuredErr) {
++		enhanced := structuredErr.Copy()
++		if structuredErr.Code == errors.CodeServiceUnavailable &&
++			strings.Contains(strings.ToLower(structuredErr.Message), "connection refused") {
++			hint := enhanced.Hint
++			if hint != "" {
++				hint += "\n\n"
++			}
++			hint += "If this endpoint is known to be up, check local network/proxy settings and try forcing IPv4 if supported. " +
++				"For diagnostics, run: curl -4 -v <bootstrap_url>/api/v1/register with the same token."
++			enhanced = enhanced.WithHint(hint)
++		}
++
++		diagCtx := ctx
++		if diagCtx == nil || diagCtx.Err() != nil {
++			diagCtx = context.Background()
++		}
++		diagnostics := runBootstrapDiagnostics(diagCtx, c.base, c.diag)
++		return appendDiagnostics(enhanced, diagnostics)
++	}
++
++	return structuredErr
++}
++
++func isNetworkBootstrapError(err *errors.Error) bool {
++	if err == nil {
++		return false
++	}
++	if err.Code == errors.CodeRequestCancelled {
++		return false
++	}
++	if err.Details == nil {
++		return false
++	}
++	return err.Details["root_error"] != ""
++}
++
++func appendDiagnostics(err *errors.Error, diagnostics diagnosticResult) *errors.Error {
++	if err == nil || len(diagnostics.lines) == 0 {
++		return err
++	}
++
++	hint := diagnostics.hint()
++	if hint != "" {
++		if err.Hint != "" {
++			hint = err.Hint + "\n\n" + hint
++		}
++		err = err.WithHint(hint)
++	}
++
++	for key, value := range diagnostics.details {
++		err = err.WithDetail(key, value)
++	}
++
++	return err
++}
+diff --git a/shared/bootstrap/service.go b/shared/bootstrap/service.go
+index a88b799..a505029 100644
+--- a/shared/bootstrap/service.go
++++ b/shared/bootstrap/service.go
+@@ -96,7 +96,7 @@ func (s *BootstrapService) Bootstrap(ctx context.Context, opts BootstrapOptions)
+ 
+ 	// Perform bootstrap with provided token
+ 	s.logger.Debug("Attempting bootstrap with provided token")
+-	return s.doBootstrap(ctx, opts.Token, opts.URL, opts.Insecure, opts.DisableProxy, opts.ForceIPv4, "bootstrap")
++	return s.doBootstrap(ctx, opts.Token, opts.URL, opts.Insecure, opts.DisableProxy, opts.ForceIPv4, opts.Verbose, "bootstrap")
+ }
+ 
+ // Refresh refreshes existing credentials using the saved JWT
+@@ -110,7 +110,7 @@ func (s *BootstrapService) Refresh(ctx context.Context, insecure bool) (*Credent
+ 	}
+ 
+ 	s.logger.Debug("Attempting refresh with existing JWT")
+-	return s.doBootstrap(ctx, info.UserJWT, info.ConnectionConfig.RefreshAddress, insecure, false, false, "refresh")
++	return s.doBootstrap(ctx, info.UserJWT, info.ConnectionConfig.RefreshAddress, insecure, false, false, false, "refresh")
+ }
+ 
+ // EnsureBootstrapped checks if bootstrap is needed and performs it if necessary
+@@ -178,6 +178,7 @@ func (s *BootstrapService) doBootstrap(
+ 	insecure bool,
+ 	disableProxy bool,
+ 	forceIPv4 bool,
++	verbose bool,
+ 	operation string,
+ ) (*CredentialInfo, error) {
+ 	// Use default URL if none provided
+@@ -189,6 +190,7 @@ func (s *BootstrapService) doBootstrap(
+ 	client, err := NewClient(ClientConfig{
+ 		BaseURL:            bootstrapURL,
+ 		Token:              token,
++		Debug:              verbose,
+ 		InsecureSkipVerify: insecure,
+ 		DisableProxy:       disableProxy,
+ 		ForceIPv4:          forceIPv4,
+diff --git a/shared/bootstrap/types.go b/shared/bootstrap/types.go
+index 8033487..4c03132 100644
+--- a/shared/bootstrap/types.go
++++ b/shared/bootstrap/types.go
+@@ -36,6 +36,9 @@ type BootstrapOptions struct {
+ 
+ 	// ForceIPv4 forces IPv4 for bootstrap requests
+ 	ForceIPv4 bool
++
++	// Verbose enables verbose diagnostics for bootstrap failures
++	Verbose bool
+ }
+ 
+ // BootstrapResponse is returned by the bootstrap service
