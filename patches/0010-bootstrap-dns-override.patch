@@ -1,0 +1,627 @@
+From 130690158cdd3d12302f9594dce9e414338cae6e Mon Sep 17 00:00:00 2001
+From: David Aronchick <aronchick@gmail.com>
+Date: Thu, 5 Feb 2026 21:09:18 -0800
+Subject: [PATCH] feat: allow bootstrap DNS overrides
+
+---
+ edge/cmd/commands/bootstrap.go   |  8 +++
+ edge/cmd/commands/run.go         |  8 +++
+ edge/cmd/flags/service.go        | 88 +++++++++++++++++++++++++++----
+ edge/cmd/flags/service_test.go   | 90 ++++++++++++++++++++++++++++++++
+ shared/bootstrap/client.go       | 48 ++++++++++++++---
+ shared/bootstrap/diagnostics.go  |  8 +++
+ shared/bootstrap/dns_override.go | 71 +++++++++++++++++++++++++
+ shared/bootstrap/service.go      | 37 ++++++++-----
+ shared/bootstrap/types.go        |  6 +++
+ 9 files changed, 334 insertions(+), 30 deletions(-)
+ create mode 100644 shared/bootstrap/dns_override.go
+
+diff --git a/edge/cmd/commands/bootstrap.go b/edge/cmd/commands/bootstrap.go
+index 94dde03..e94f894 100644
+--- a/edge/cmd/commands/bootstrap.go
++++ b/edge/cmd/commands/bootstrap.go
+@@ -24,6 +24,8 @@ type bootstrapConfig struct {
+ 	Insecure       bool
+ 	NoProxy        bool
+ 	ForceIPv4      bool
++	DNSServers     string
++	ResolvConf     string
+ }
+ 
+ // NewBootstrapCommand creates the bootstrap command
+@@ -99,6 +101,8 @@ Examples:
+ 	cmd.Flags().BoolVarP(&cfg.Insecure, "insecure", "k", false, "Skip TLS certificate verification")
+ 	cmd.Flags().BoolVar(&cfg.NoProxy, "no-proxy", false, "Disable HTTP proxy usage for bootstrap requests")
+ 	cmd.Flags().BoolVar(&cfg.ForceIPv4, "force-ipv4", false, "Force IPv4 for bootstrap requests (useful on networks with broken IPv6)")
++	cmd.Flags().StringVar(&cfg.DNSServers, "dns-servers", "", "Override DNS servers for bootstrap (comma-separated)")
++	cmd.Flags().StringVar(&cfg.ResolvConf, "resolv-conf", "", "Use DNS servers from a specific resolv.conf file for bootstrap")
+ 
+ 	cmd.PersistentFlags().StringSliceVarP(&cfg.ConfigPaths, "config", "c", nil, "Paths to configuration files or directories")
+ 	cmd.Flags().StringVar(&cfg.DataDir, "data-dir", "", "Data directory path")
+@@ -139,6 +143,8 @@ func runBootstrap(cmd *cobra.Command, cfg *bootstrapConfig) error {
+ 	insecure := flags.ResolveBootstrapInsecure(cfg.Insecure)
+ 	disableProxy := flags.ResolveBootstrapNoProxy(cfg.NoProxy)
+ 	forceIPv4 := flags.ResolveBootstrapForceIPv4(cfg.ForceIPv4)
++	dnsServers := flags.ResolveBootstrapDNSServers(cfg.DNSServers)
++	resolvConf := flags.ResolveBootstrapResolvConf(cfg.ResolvConf)
+ 	_, err = bootstrapService.Bootstrap(ctx, bootstrap.BootstrapOptions{
+ 		Token:        token,
+ 		URL:          url,
+@@ -146,6 +152,8 @@ func runBootstrap(cmd *cobra.Command, cfg *bootstrapConfig) error {
+ 		Insecure:     insecure,
+ 		DisableProxy: disableProxy,
+ 		ForceIPv4:    forceIPv4,
++		DNSServers:   dnsServers,
++		ResolvConf:   resolvConf,
+ 		Verbose:      verbose,
+ 	})
+ 	if err != nil {
+diff --git a/edge/cmd/commands/run.go b/edge/cmd/commands/run.go
+index 0ee9201..9a99a89 100644
+--- a/edge/cmd/commands/run.go
++++ b/edge/cmd/commands/run.go
+@@ -104,6 +104,8 @@ func runServiceDirectly(cmd *cobra.Command, cfg *flags.ServiceRunConfig) error {
+ 		cfg.GetBootstrapInsecure(),
+ 		cfg.GetBootstrapNoProxy(),
+ 		cfg.GetBootstrapForceIPv4(),
++		cfg.GetBootstrapDNSServers(),
++		cfg.GetBootstrapResolvConf(),
+ 		verbose,
+ 		configManager,
+ 	); err != nil {
+@@ -175,6 +177,8 @@ func runWithSupervisor(cmd *cobra.Command, cfg *flags.ServiceRunConfig) error {
+ 		cfg.GetBootstrapInsecure(),
+ 		cfg.GetBootstrapNoProxy(),
+ 		cfg.GetBootstrapForceIPv4(),
++		cfg.GetBootstrapDNSServers(),
++		cfg.GetBootstrapResolvConf(),
+ 		verbose,
+ 		configManager,
+ 	); err != nil {
+@@ -242,6 +246,8 @@ func ensureRegistered(
+ 	insecure bool,
+ 	disableProxy bool,
+ 	forceIPv4 bool,
++	dnsServers []string,
++	resolvConf string,
+ 	verbose bool,
+ 	configManager interfaces.EdgeConfigManager,
+ ) error {
+@@ -258,6 +264,8 @@ func ensureRegistered(
+ 		Insecure:     insecure,
+ 		DisableProxy: disableProxy,
+ 		ForceIPv4:    forceIPv4,
++		DNSServers:   dnsServers,
++		ResolvConf:   resolvConf,
+ 		Verbose:      verbose,
+ 	})
+ 	if err != nil {
+diff --git a/edge/cmd/flags/service.go b/edge/cmd/flags/service.go
+index 69ea6e3..168517f 100644
+--- a/edge/cmd/flags/service.go
++++ b/edge/cmd/flags/service.go
+@@ -2,6 +2,7 @@ package flags
+ 
+ import (
+ 	"os"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/spf13/cobra"
+@@ -9,11 +10,13 @@ import (
+ 
+ // Bootstrap environment variable names
+ const (
+-	EnvBootstrapToken     = "EXPANSO_EDGE_BOOTSTRAP_TOKEN" //nolint:gosec // G101 false positive - env var name, not a credential
+-	EnvBootstrapURL       = "EXPANSO_EDGE_BOOTSTRAP_URL"
+-	EnvBootstrapInsecure  = "EXPANSO_EDGE_BOOTSTRAP_INSECURE"
+-	EnvBootstrapNoProxy   = "EXPANSO_EDGE_BOOTSTRAP_NO_PROXY"
+-	EnvBootstrapForceIPv4 = "EXPANSO_EDGE_BOOTSTRAP_FORCE_IPV4"
++	EnvBootstrapToken      = "EXPANSO_EDGE_BOOTSTRAP_TOKEN" //nolint:gosec // G101 false positive - env var name, not a credential
++	EnvBootstrapURL        = "EXPANSO_EDGE_BOOTSTRAP_URL"
++	EnvBootstrapInsecure   = "EXPANSO_EDGE_BOOTSTRAP_INSECURE"
++	EnvBootstrapNoProxy    = "EXPANSO_EDGE_BOOTSTRAP_NO_PROXY"
++	EnvBootstrapForceIPv4  = "EXPANSO_EDGE_BOOTSTRAP_FORCE_IPV4"
++	EnvBootstrapDNSServers = "EXPANSO_EDGE_BOOTSTRAP_DNS_SERVERS"
++	EnvBootstrapResolvConf = "EXPANSO_EDGE_BOOTSTRAP_RESOLV_CONF"
+ )
+ 
+ const (
+@@ -65,6 +68,47 @@ func ResolveBootstrapForceIPv4(cliValue bool) bool {
+ 	return envBool(os.Getenv(EnvBootstrapForceIPv4))
+ }
+ 
++// ResolveBootstrapDNSServers returns DNS servers for bootstrap, preferring CLI over env
++func ResolveBootstrapDNSServers(cliValue string) []string {
++	if cliValue != "" {
++		return splitCSV(cliValue)
++	}
++	envValue := os.Getenv(EnvBootstrapDNSServers)
++	if envValue == "" {
++		return nil
++	}
++	return splitCSV(envValue)
++}
++
++// ResolveBootstrapResolvConf returns resolv.conf override path, preferring CLI over env
++func ResolveBootstrapResolvConf(cliValue string) string {
++	if cliValue != "" {
++		return cliValue
++	}
++	return os.Getenv(EnvBootstrapResolvConf)
++}
++
++func splitCSV(value string) []string {
++	if value == "" {
++		return nil
++	}
++	parts := strings.FieldsFunc(value, func(r rune) bool {
++		return r == ',' || r == ' ' || r == '\t' || r == '\n'
++	})
++	results := make([]string, 0, len(parts))
++	for _, part := range parts {
++		part = strings.TrimSpace(part)
++		if part == "" {
++			continue
++		}
++		results = append(results, part)
++	}
++	if len(results) == 0 {
++		return nil
++	}
++	return results
++}
++
+ // ServiceConfig holds all configuration for the service command
+ type ServiceConfig struct {
+ 	ConfigPaths  []string
+@@ -77,11 +121,13 @@ type ServiceConfig struct {
+ 	Verbose      bool
+ 
+ 	// Bootstrap
+-	BootstrapToken     string
+-	BootstrapURL       string
+-	BootstrapInsecure  bool
+-	BootstrapNoProxy   bool
+-	BootstrapForceIPv4 bool
++	BootstrapToken      string
++	BootstrapURL        string
++	BootstrapInsecure   bool
++	BootstrapNoProxy    bool
++	BootstrapForceIPv4  bool
++	BootstrapDNSServers string
++	BootstrapResolvConf string
+ 
+ 	// Convenience flags
+ 	LocalMode bool
+@@ -112,6 +158,16 @@ func (c *ServiceConfig) GetBootstrapForceIPv4() bool {
+ 	return ResolveBootstrapForceIPv4(c.BootstrapForceIPv4)
+ }
+ 
++// GetBootstrapDNSServers returns bootstrap DNS server overrides
++func (c *ServiceConfig) GetBootstrapDNSServers() []string {
++	return ResolveBootstrapDNSServers(c.BootstrapDNSServers)
++}
++
++// GetBootstrapResolvConf returns bootstrap resolv.conf override path
++func (c *ServiceConfig) GetBootstrapResolvConf() string {
++	return ResolveBootstrapResolvConf(c.BootstrapResolvConf)
++}
++
+ // ServiceRunConfig holds all configuration for the service run command
+ type ServiceRunConfig struct {
+ 	ServiceConfig
+@@ -165,6 +221,18 @@ func AddServiceConfigFlags(cmd *cobra.Command, cfg *ServiceConfig) {
+ 		false,
+ 		"Force IPv4 for bootstrap requests (useful on networks with broken IPv6)",
+ 	)
++	cmd.Flags().StringVar(
++		&cfg.BootstrapDNSServers,
++		"bootstrap-dns-servers",
++		"",
++		"Override bootstrap DNS servers (comma-separated)",
++	)
++	cmd.Flags().StringVar(
++		&cfg.BootstrapResolvConf,
++		"bootstrap-resolv-conf",
++		"",
++		"Use DNS servers from a specific resolv.conf file for bootstrap",
++	)
+ 
+ 	// Convenience flags
+ 	cmd.Flags().BoolVar(&cfg.LocalMode, "local", false, "Run in local mode (no control plane connection)")
+diff --git a/edge/cmd/flags/service_test.go b/edge/cmd/flags/service_test.go
+index 37e2e8b..4c85243 100644
+--- a/edge/cmd/flags/service_test.go
++++ b/edge/cmd/flags/service_test.go
+@@ -205,3 +205,93 @@ func TestResolveBootstrapForceIPv4(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestResolveBootstrapDNSServers(t *testing.T) {
++	tests := []struct {
++		name     string
++		cliValue string
++		envValue string
++		expected []string
++	}{
++		{
++			name:     "CLI overrides env",
++			cliValue: "1.1.1.1, 8.8.8.8",
++			envValue: "9.9.9.9",
++			expected: []string{"1.1.1.1", "8.8.8.8"},
++		},
++		{
++			name:     "Env used when CLI empty",
++			cliValue: "",
++			envValue: "8.8.8.8 1.1.1.1",
++			expected: []string{"8.8.8.8", "1.1.1.1"},
++		},
++		{
++			name:     "Empty when both unset",
++			cliValue: "",
++			envValue: "",
++			expected: nil,
++		},
++		{
++			name:     "Whitespace filtered",
++			cliValue: "  , 8.8.4.4 , ",
++			envValue: "",
++			expected: []string{"8.8.4.4"},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if tt.envValue != "" {
++				os.Setenv(EnvBootstrapDNSServers, tt.envValue)
++				defer os.Unsetenv(EnvBootstrapDNSServers)
++			} else {
++				os.Unsetenv(EnvBootstrapDNSServers)
++			}
++
++			result := ResolveBootstrapDNSServers(tt.cliValue)
++			assert.Equal(t, tt.expected, result)
++		})
++	}
++}
++
++func TestResolveBootstrapResolvConf(t *testing.T) {
++	tests := []struct {
++		name     string
++		cliValue string
++		envValue string
++		expected string
++	}{
++		{
++			name:     "CLI overrides env",
++			cliValue: "/tmp/override.conf",
++			envValue: "/etc/resolv.conf",
++			expected: "/tmp/override.conf",
++		},
++		{
++			name:     "Env used when CLI empty",
++			cliValue: "",
++			envValue: "/etc/resolv.conf",
++			expected: "/etc/resolv.conf",
++		},
++		{
++			name:     "Empty when both unset",
++			cliValue: "",
++			envValue: "",
++			expected: "",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if tt.envValue != "" {
++				os.Setenv(EnvBootstrapResolvConf, tt.envValue)
++				defer os.Unsetenv(EnvBootstrapResolvConf)
++			} else {
++				os.Unsetenv(EnvBootstrapResolvConf)
++			}
++
++			result := ResolveBootstrapResolvConf(tt.cliValue)
++			assert.Equal(t, tt.expected, result)
++		})
++	}
++}
+diff --git a/shared/bootstrap/client.go b/shared/bootstrap/client.go
+index 2eab5ca..20f16d7 100644
+--- a/shared/bootstrap/client.go
++++ b/shared/bootstrap/client.go
+@@ -63,6 +63,15 @@ type ClientConfig struct {
+ 
+ 	// ForceIPv4 forces IPv4 for bootstrap requests
+ 	ForceIPv4 bool
++
++	// PreferGoDNS forces the Go DNS resolver for bootstrap requests
++	PreferGoDNS bool
++
++	// DNSServers overrides DNS resolution for bootstrap requests
++	DNSServers []string
++
++	// DNSSource describes the DNS override source for diagnostics
++	DNSSource string
+ }
+ 
+ // NewClient creates a new bootstrap client
+@@ -88,6 +97,8 @@ func NewClient(config ClientConfig) (*Client, error) {
+ 		InsecureSkipVerify: config.InsecureSkipVerify,
+ 		DisableProxy:       config.DisableProxy,
+ 		ForceIPv4:          config.ForceIPv4,
++		PreferGoDNS:        config.PreferGoDNS,
++		DNSServers:         config.DNSServers,
+ 		Auth: corehttp.AuthConfig{
+ 			Token: config.Token,
+ 		},
+@@ -108,12 +119,22 @@ func NewClient(config ClientConfig) (*Client, error) {
+ 			forceIPv4:          config.ForceIPv4,
+ 			insecureSkipVerify: config.InsecureSkipVerify,
+ 			timeout:            config.Timeout,
++			dnsServers:         config.DNSServers,
++			dnsSource:          config.DNSSource,
+ 		},
+ 	}, nil
+ }
+ 
+ // Bootstrap performs bootstrap with the bootstrap service
+ func (c *Client) Bootstrap(ctx context.Context, req *BootstrapRequest) (*BootstrapResponse, error) {
++	response, err := c.bootstrapOnce(ctx, req)
++	if err != nil {
++		return nil, c.formatBootstrapError(ctx, err)
++	}
++	return c.validateBootstrapResponse(response)
++}
++
++func (c *Client) bootstrapOnce(ctx context.Context, req *BootstrapRequest) (*BootstrapResponse, error) {
+ 	var response BootstrapResponse
+ 
+ 	_, err := c.http.R().
+@@ -121,14 +142,20 @@ func (c *Client) Bootstrap(ctx context.Context, req *BootstrapRequest) (*Bootstr
+ 		SetBody(req).
+ 		SetSuccessResult(&response).
+ 		Post("/api/v1/register")
+-
+ 	if err != nil {
+-		if enhanced := c.enhanceBootstrapError(ctx, err); enhanced != nil {
+-			return nil, enhanced
+-		}
+-		return nil, fmt.Errorf("bootstrap request failed: %w", err)
++		return nil, err
++	}
++
++	return &response, nil
++}
++
++func (c *Client) validateBootstrapResponse(response *BootstrapResponse) (*BootstrapResponse, error) {
++	if response == nil {
++		return nil, errors.New("bootstrap response was empty").
++			WithCode(errors.CodeBadRequest).
++			WithComponent("BootstrapClient").
++			WithHint("The bootstrap service returned an empty response")
+ 	}
+-	// Validate response
+ 	if response.NodeID == "" {
+ 		return nil, errors.New("bootstrap response missing client ID").
+ 			WithCode(errors.CodeBadRequest).
+@@ -148,7 +175,14 @@ func (c *Client) Bootstrap(ctx context.Context, req *BootstrapRequest) (*Bootstr
+ 			WithHint("The bootstrap service returned an incomplete response")
+ 	}
+ 
+-	return &response, nil
++	return response, nil
++}
++
++func (c *Client) formatBootstrapError(ctx context.Context, err error) error {
++	if enhanced := c.enhanceBootstrapError(ctx, err); enhanced != nil {
++		return enhanced
++	}
++	return fmt.Errorf("bootstrap request failed: %w", err)
+ }
+ 
+ func (c *Client) enhanceBootstrapError(ctx context.Context, err error) error {
+diff --git a/shared/bootstrap/diagnostics.go b/shared/bootstrap/diagnostics.go
+index 1533256..9857ae4 100644
+--- a/shared/bootstrap/diagnostics.go
++++ b/shared/bootstrap/diagnostics.go
+@@ -21,6 +21,8 @@ type diagnosticsConfig struct {
+ 	forceIPv4          bool
+ 	insecureSkipVerify bool
+ 	timeout            time.Duration
++	dnsServers         []string
++	dnsSource          string
+ }
+ 
+ const schemeHTTPS = "https"
+@@ -85,6 +87,12 @@ func runBootstrapDiagnostics(ctx context.Context, baseURL string, cfg diagnostic
+ 	if len(resolvServers) > 0 {
+ 		result.add("DNS Servers", strings.Join(resolvServers, ", "))
+ 	}
++	if len(cfg.dnsServers) > 0 {
++		result.add("DNS Override", strings.Join(cfg.dnsServers, ", "))
++	}
++	if cfg.dnsSource != "" {
++		result.add("DNS Override Source", cfg.dnsSource)
++	}
+ 	if runtime.GOOS == "android" {
+ 		if props := androidDNSProps(); len(props) > 0 {
+ 			result.add("Android DNS", strings.Join(props, ", "))
+diff --git a/shared/bootstrap/dns_override.go b/shared/bootstrap/dns_override.go
+new file mode 100644
+index 0000000..5566f30
+--- /dev/null
++++ b/shared/bootstrap/dns_override.go
+@@ -0,0 +1,71 @@
++package bootstrap
++
++import (
++	"fmt"
++	"os"
++	"strings"
++
++	"github.com/expanso-io/expanso/lib/errors"
++)
++
++type dnsOverride struct {
++	servers []string
++	source  string
++}
++
++func resolveBootstrapDNSServers(opts BootstrapOptions) (dnsOverride, error) {
++	if len(opts.DNSServers) > 0 {
++		servers := normalizeServerList(opts.DNSServers)
++		if len(servers) == 0 {
++			return dnsOverride{}, errors.New("bootstrap DNS override is empty").
++				WithCode(errors.CodeBadRequest).
++				WithComponent("BootstrapService").
++				WithHint("Provide at least one DNS server address")
++		}
++		return dnsOverride{servers: servers, source: "override"}, nil
++	}
++
++	if opts.ResolvConf == "" {
++		return dnsOverride{}, nil
++	}
++
++	contents, err := os.ReadFile(opts.ResolvConf)
++	if err != nil {
++		return dnsOverride{}, errors.Newf("failed to read resolv.conf override (%s)", opts.ResolvConf).
++			WithCode(errors.CodeBadRequest).
++			WithComponent("BootstrapService").
++			WithHint("Check the resolv.conf path and file permissions")
++	}
++
++	servers := normalizeServerList(parseResolvConf(string(contents)))
++	if len(servers) == 0 {
++		return dnsOverride{}, errors.Newf("no DNS servers found in %s", opts.ResolvConf).
++			WithCode(errors.CodeBadRequest).
++			WithComponent("BootstrapService").
++			WithHint("Add at least one nameserver entry to the resolv.conf override")
++	}
++
++	return dnsOverride{servers: servers, source: fmt.Sprintf("resolv.conf:%s", opts.ResolvConf)}, nil
++}
++
++func normalizeServerList(servers []string) []string {
++	if len(servers) == 0 {
++		return nil
++	}
++
++	seen := map[string]struct{}{}
++	normalized := []string{}
++	for _, server := range servers {
++		server = strings.TrimSpace(server)
++		if server == "" {
++			continue
++		}
++		if _, ok := seen[server]; ok {
++			continue
++		}
++		seen[server] = struct{}{}
++		normalized = append(normalized, server)
++	}
++
++	return normalized
++}
+diff --git a/shared/bootstrap/service.go b/shared/bootstrap/service.go
+index a505029..b25a717 100644
+--- a/shared/bootstrap/service.go
++++ b/shared/bootstrap/service.go
+@@ -96,7 +96,7 @@ func (s *BootstrapService) Bootstrap(ctx context.Context, opts BootstrapOptions)
+ 
+ 	// Perform bootstrap with provided token
+ 	s.logger.Debug("Attempting bootstrap with provided token")
+-	return s.doBootstrap(ctx, opts.Token, opts.URL, opts.Insecure, opts.DisableProxy, opts.ForceIPv4, opts.Verbose, "bootstrap")
++	return s.doBootstrap(ctx, opts, "bootstrap")
+ }
+ 
+ // Refresh refreshes existing credentials using the saved JWT
+@@ -110,7 +110,11 @@ func (s *BootstrapService) Refresh(ctx context.Context, insecure bool) (*Credent
+ 	}
+ 
+ 	s.logger.Debug("Attempting refresh with existing JWT")
+-	return s.doBootstrap(ctx, info.UserJWT, info.ConnectionConfig.RefreshAddress, insecure, false, false, false, "refresh")
++	return s.doBootstrap(ctx, BootstrapOptions{
++		Token:    info.UserJWT,
++		URL:      info.ConnectionConfig.RefreshAddress,
++		Insecure: insecure,
++	}, "refresh")
+ }
+ 
+ // EnsureBootstrapped checks if bootstrap is needed and performs it if necessary
+@@ -154,6 +158,9 @@ func (s *BootstrapService) EnsureBootstrapped(ctx context.Context, opts Bootstra
+ 		Insecure:     opts.Insecure,
+ 		DisableProxy: opts.DisableProxy,
+ 		ForceIPv4:    opts.ForceIPv4,
++		DNSServers:   opts.DNSServers,
++		ResolvConf:   opts.ResolvConf,
++		Verbose:      opts.Verbose,
+ 	})
+ 	if err != nil {
+ 		// Handle already bootstrapped case gracefully
+@@ -173,27 +180,31 @@ func (s *BootstrapService) EnsureBootstrapped(ctx context.Context, opts Bootstra
+ // 4. Returns complete CredentialInfo
+ func (s *BootstrapService) doBootstrap(
+ 	ctx context.Context,
+-	token,
+-	bootstrapURL string,
+-	insecure bool,
+-	disableProxy bool,
+-	forceIPv4 bool,
+-	verbose bool,
++	opts BootstrapOptions,
+ 	operation string,
+ ) (*CredentialInfo, error) {
+ 	// Use default URL if none provided
++	bootstrapURL := opts.URL
+ 	if bootstrapURL == "" {
+ 		bootstrapURL = DefaultBootstrapURL
+ 	}
+ 
++	dnsOverride, err := resolveBootstrapDNSServers(opts)
++	if err != nil {
++		return nil, err
++	}
++
+ 	// Create client with the token
+ 	client, err := NewClient(ClientConfig{
+ 		BaseURL:            bootstrapURL,
+-		Token:              token,
+-		Debug:              verbose,
+-		InsecureSkipVerify: insecure,
+-		DisableProxy:       disableProxy,
+-		ForceIPv4:          forceIPv4,
++		Token:              opts.Token,
++		Debug:              opts.Verbose,
++		InsecureSkipVerify: opts.Insecure,
++		DisableProxy:       opts.DisableProxy,
++		ForceIPv4:          opts.ForceIPv4,
++		PreferGoDNS:        len(dnsOverride.servers) > 0,
++		DNSServers:         dnsOverride.servers,
++		DNSSource:          dnsOverride.source,
+ 	})
+ 	if err != nil {
+ 		return nil, errors.Wrap(err, "failed to create bootstrap client")
+diff --git a/shared/bootstrap/types.go b/shared/bootstrap/types.go
+index 4c03132..838adce 100644
+--- a/shared/bootstrap/types.go
++++ b/shared/bootstrap/types.go
+@@ -37,6 +37,12 @@ type BootstrapOptions struct {
+ 	// ForceIPv4 forces IPv4 for bootstrap requests
+ 	ForceIPv4 bool
+ 
++	// DNSServers overrides DNS resolution for bootstrap requests
++	DNSServers []string
++
++	// ResolvConf overrides the resolv.conf path used to derive DNS servers for bootstrap
++	ResolvConf string
++
+ 	// Verbose enables verbose diagnostics for bootstrap failures
+ 	Verbose bool
+ }
+-- 
+2.52.0
+
