@@ -1,0 +1,780 @@
+From a0edf868af2cae6d7dc3617188fdd18f6b32bfef Mon Sep 17 00:00:00 2001
+From: David Aronchick <aronchick@gmail.com>
+Date: Fri, 6 Feb 2026 08:23:38 -0800
+Subject: [PATCH] feat: allow DNS overrides for NATS and telemetry
+
+---
+ edge/internal/transport/errors.go             |  15 +-
+ shared/telemetry/dns_override.go              | 174 ++++++++++++++++++
+ shared/telemetry/otel_log_handler.go          |   8 +
+ shared/telemetry/provider.go                  |  12 ++
+ shared/transport/ncltransport/client.go       | 120 ++++++++++++
+ shared/transport/ncltransport/dns_override.go | 124 +++++++++++++
+ .../ncltransport/dns_override_test.go         |  47 +++++
+ shared/transport/ncltransport/edge.go         |  26 ++-
+ shared/transport/ncltransport/orchestrator.go |  22 ++-
+ types/config_edge.go                          |  10 +
+ types/connection.go                           |  18 +-
+ types/telemetry.go                            |   8 +
+ 12 files changed, 562 insertions(+), 22 deletions(-)
+ create mode 100644 shared/telemetry/dns_override.go
+ create mode 100644 shared/transport/ncltransport/dns_override.go
+ create mode 100644 shared/transport/ncltransport/dns_override_test.go
+
+diff --git a/edge/internal/transport/errors.go b/edge/internal/transport/errors.go
+index 629d69b..cf5cc7c 100644
+--- a/edge/internal/transport/errors.go
++++ b/edge/internal/transport/errors.go
+@@ -9,10 +9,17 @@ const errComponent = "edge.transport"
+ 
+ // ErrConnectionFailed creates a connection failed error
+ func ErrConnectionFailed(err error) *errors.Error {
+-	return errors.Wrap(err, "failed to establish connection").
+-		WithCode(errors.CodeNetworkError).
+-		WithComponent(errComponent).
+-		WithHint("Check network connectivity and orchestrator availability")
++	wrapped := errors.Wrap(err, "failed to establish connection").
++		WithComponent(errComponent)
++
++	if wrapped.Code == "" || wrapped.Code == errors.CodeUnknown {
++		wrapped.WithCode(errors.CodeNetworkError)
++	}
++	if wrapped.Hint == "" {
++		wrapped.WithHint("Check network connectivity and orchestrator availability")
++	}
++
++	return wrapped
+ }
+ 
+ // ErrConnectionUnhealthy creates a connection unhealthy error
+diff --git a/shared/telemetry/dns_override.go b/shared/telemetry/dns_override.go
+new file mode 100644
+index 0000000..87e097d
+--- /dev/null
++++ b/shared/telemetry/dns_override.go
+@@ -0,0 +1,174 @@
++package telemetry
++
++import (
++	"bufio"
++	"context"
++	"net"
++	"net/http"
++	"os"
++	"strings"
++
++	"github.com/expanso-io/expanso/lib/errors"
++	"github.com/expanso-io/expanso/types"
++	"log/slog"
++)
++
++type telemetryDNSOverride struct {
++	servers []string
++	source  string
++}
++
++func resolveTelemetryDNSOverride(cfg *types.TelemetryConfig) (telemetryDNSOverride, error) {
++	if cfg == nil {
++		return telemetryDNSOverride{}, nil
++	}
++	if len(cfg.DNSServers) > 0 {
++		servers := normalizeTelemetryDNSServerList(cfg.DNSServers)
++		if len(servers) == 0 {
++			return telemetryDNSOverride{}, errors.New("telemetry DNS override is empty").
++				WithCode(errors.CodeConfigurationError).
++				WithComponent("telemetry").
++				WithHint("Provide at least one DNS server address")
++		}
++		return telemetryDNSOverride{servers: servers, source: "override"}, nil
++	}
++
++	if cfg.ResolvConf == "" {
++		return telemetryDNSOverride{}, nil
++	}
++
++	contents, err := os.ReadFile(cfg.ResolvConf)
++	if err != nil {
++		return telemetryDNSOverride{}, errors.Newf("failed to read resolv.conf override (%s)", cfg.ResolvConf).
++			WithCode(errors.CodeConfigurationError).
++			WithComponent("telemetry").
++			WithHint("Check the resolv.conf path and file permissions")
++	}
++
++	servers := normalizeTelemetryDNSServerList(parseTelemetryResolvConf(string(contents)))
++	if len(servers) == 0 {
++		return telemetryDNSOverride{}, errors.Newf("no DNS servers found in %s", cfg.ResolvConf).
++			WithCode(errors.CodeConfigurationError).
++			WithComponent("telemetry").
++			WithHint("Add at least one nameserver entry to the resolv.conf override")
++	}
++
++	return telemetryDNSOverride{servers: servers, source: "resolv.conf:" + cfg.ResolvConf}, nil
++}
++
++func buildTelemetryHTTPClient(cfg *types.TelemetryConfig, logger *slog.Logger) (*http.Client, error) {
++	override, err := resolveTelemetryDNSOverride(cfg)
++	if err != nil {
++		return nil, err
++	}
++	if len(override.servers) == 0 {
++		return nil, nil
++	}
++
++	if logger != nil {
++		logger.Info("Using DNS override for telemetry exporter",
++			"servers", strings.Join(override.servers, ", "),
++			"source", override.source)
++	}
++
++	baseDialer := net.Dialer{Timeout: cfg.GetExportTimeout()}
++	resolver := &net.Resolver{
++		PreferGo: true,
++		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
++			server := override.servers[0]
++			return baseDialer.DialContext(ctx, telemetryDNSNetwork(network), server)
++		},
++	}
++
++	transport := http.DefaultTransport.(*http.Transport).Clone()
++	transport.DialContext = (&net.Dialer{
++		Timeout:  cfg.GetExportTimeout(),
++		Resolver: resolver,
++	}).DialContext
++
++	return &http.Client{
++		Transport: transport,
++		Timeout:   cfg.GetExportTimeout(),
++	}, nil
++}
++
++func telemetryDNSNetwork(network string) string {
++	network = strings.ToLower(network)
++	switch {
++	case strings.HasPrefix(network, "tcp"):
++		return "tcp"
++	case strings.HasPrefix(network, "udp"):
++		return "udp"
++	default:
++		return "udp"
++	}
++}
++
++func parseTelemetryResolvConf(contents string) []string {
++	if contents == "" {
++		return nil
++	}
++	servers := []string{}
++	seen := map[string]struct{}{}
++	scanner := bufio.NewScanner(strings.NewReader(contents))
++	for scanner.Scan() {
++		line := strings.TrimSpace(scanner.Text())
++		if line == "" || strings.HasPrefix(line, "#") {
++			continue
++		}
++		fields := strings.Fields(line)
++		if len(fields) < 2 || fields[0] != "nameserver" {
++			continue
++		}
++		server := fields[1]
++		if _, ok := seen[server]; ok {
++			continue
++		}
++		seen[server] = struct{}{}
++		servers = append(servers, server)
++	}
++	return servers
++}
++
++func normalizeTelemetryDNSServerList(servers []string) []string {
++	if len(servers) == 0 {
++		return nil
++	}
++	normalized := []string{}
++	seen := map[string]struct{}{}
++	for _, server := range servers {
++		server = strings.TrimSpace(server)
++		if server == "" {
++			continue
++		}
++		addr := normalizeTelemetryDNSServerAddr(server)
++		if addr == "" {
++			continue
++		}
++		if _, ok := seen[addr]; ok {
++			continue
++		}
++		seen[addr] = struct{}{}
++		normalized = append(normalized, addr)
++	}
++	return normalized
++}
++
++func normalizeTelemetryDNSServerAddr(server string) string {
++	if server == "" {
++		return ""
++	}
++	if host, port, err := net.SplitHostPort(server); err == nil {
++		if port == "" {
++			port = "53"
++		}
++		return net.JoinHostPort(host, port)
++	}
++	if ip := net.ParseIP(server); ip != nil {
++		return net.JoinHostPort(server, "53")
++	}
++	if strings.Count(server, ":") >= 2 {
++		return net.JoinHostPort(server, "53")
++	}
++	return net.JoinHostPort(server, "53")
++}
+diff --git a/shared/telemetry/otel_log_handler.go b/shared/telemetry/otel_log_handler.go
+index 34838dd..96e3afc 100644
+--- a/shared/telemetry/otel_log_handler.go
++++ b/shared/telemetry/otel_log_handler.go
+@@ -48,6 +48,14 @@ func initOtelHandler(
+ 		)
+ 	}
+ 
++	httpClient, err := buildTelemetryHTTPClient(telemetryConfig, slog.Default().With("component", "telemetry"))
++	if err != nil {
++		return nil, nil, err
++	}
++	if httpClient != nil {
++		telemetryOptions = append(telemetryOptions, otlploghttp.WithHTTPClient(httpClient))
++	}
++
+ 	exp, err := otlploghttp.New(ctx, telemetryOptions...)
+ 	if err != nil {
+ 		return nil, nil, err
+diff --git a/shared/telemetry/provider.go b/shared/telemetry/provider.go
+index be118b5..f60af6b 100644
+--- a/shared/telemetry/provider.go
++++ b/shared/telemetry/provider.go
+@@ -235,6 +235,10 @@ func (p *Provider) createOTLPReader(ctx context.Context) (sdkmetric.Reader, erro
+ 	endpoint := p.config.GetNormalizedEndpoint()
+ 	endpoint_path := p.config.GetEndpointPath()
+ 	protocol := p.config.GetProtocol()
++	if (len(p.config.DNSServers) > 0 || p.config.ResolvConf != "") && protocol != "http" {
++		p.logger.Warn("Telemetry DNS override is only supported for HTTP protocol",
++			"protocol", protocol)
++	}
+ 
+ 	switch protocol {
+ 	case "grpc":
+@@ -301,6 +305,14 @@ func (p *Provider) createOTLPHTTPExporter(ctx context.Context, endpoint, endpoin
+ 		opts = append(opts, otlpmetrichttp.WithInsecure())
+ 	}
+ 
++	httpClient, err := buildTelemetryHTTPClient(p.config, p.logger)
++	if err != nil {
++		return nil, err
++	}
++	if httpClient != nil {
++		opts = append(opts, otlpmetrichttp.WithHTTPClient(httpClient))
++	}
++
+ 	return otlpmetrichttp.New(ctx, opts...)
+ }
+ 
+diff --git a/shared/transport/ncltransport/client.go b/shared/transport/ncltransport/client.go
+index b9bfa20..f81464a 100644
+--- a/shared/transport/ncltransport/client.go
++++ b/shared/transport/ncltransport/client.go
+@@ -1,9 +1,13 @@
+ package ncltransport
+ 
+ import (
++	"context"
+ 	"crypto/tls"
+ 	"crypto/x509"
+ 	"log/slog"
++	"net"
++	"net/url"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/expanso-io/expanso/lib/errors"
+@@ -30,6 +34,15 @@ type ClientConfig struct {
+ 	// Logger is an optional logger. If nil, slog.Default() is used.
+ 	Logger *slog.Logger
+ 
++	// PreferGoDNS forces the Go DNS resolver (useful on platforms with broken system DNS)
++	PreferGoDNS bool
++
++	// DNSServers overrides DNS resolution to use the provided servers (e.g. 8.8.8.8, 1.1.1.1)
++	DNSServers []string
++
++	// DNSSource describes the DNS override source for diagnostics
++	DNSSource string
++
+ 	// Optional callbacks
+ 	OnDisconnect func(nc *nats.Conn, err error)
+ 	OnReconnect  func(nc *nats.Conn)
+@@ -147,9 +160,21 @@ func CreateNATSClient(config ClientConfig) (*nats.Conn, error) {
+ 			"error", err)
+ 	}))
+ 
++	resolver, dnsServers := buildDNSResolver(config)
++	if resolver != nil {
++		dialer := &net.Dialer{
++			Timeout:  config.ConnectTimeout,
++			Resolver: resolver,
++		}
++		opts = append(opts, nats.SetCustomDialer(dialer))
++	}
++
+ 	// Connect to NATS
+ 	nc, err := nats.Connect(config.ServerURL, opts...)
+ 	if err != nil {
++		if dnsErr := classifyNATSDNSError(err, config, dnsServers, resolver); dnsErr != nil {
++			return nil, dnsErr
++		}
+ 		return nil, errors.Wrap(err, "failed to connect to NATS server")
+ 	}
+ 
+@@ -176,3 +201,98 @@ func createTLSConfigWithCACerts(caCerts string) (*tls.Config, error) {
+ 		MinVersion: tls.VersionTLS12,
+ 	}, nil
+ }
++
++func buildDNSResolver(config ClientConfig) (*net.Resolver, []string) {
++	if !config.PreferGoDNS && len(config.DNSServers) == 0 {
++		return nil, nil
++	}
++
++	servers := normalizeDNSServerList(config.DNSServers)
++	resolver := &net.Resolver{
++		PreferGo: true,
++	}
++
++	if len(servers) > 0 {
++		baseDialer := net.Dialer{Timeout: config.ConnectTimeout}
++		resolver.Dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
++			server := servers[0]
++			dnsNetwork := dnsDialNetwork(network)
++			return baseDialer.DialContext(ctx, dnsNetwork, server)
++		}
++	}
++
++	return resolver, servers
++}
++
++func dnsDialNetwork(network string) string {
++	network = strings.ToLower(network)
++	switch {
++	case strings.HasPrefix(network, "tcp"):
++		return "tcp"
++	case strings.HasPrefix(network, "udp"):
++		return "udp"
++	default:
++		return "udp"
++	}
++}
++
++func classifyNATSDNSError(err error, config ClientConfig, dnsServers []string, resolver *net.Resolver) *errors.Error {
++	host := extractNATSServerHost(config.ServerURL)
++	if host == "" {
++		return nil
++	}
++	if net.ParseIP(host) != nil {
++		return nil
++	}
++
++	if resolver == nil {
++		resolver = net.DefaultResolver
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), config.ConnectTimeout)
++	defer cancel()
++
++	if _, lookupErr := resolver.LookupIPAddr(ctx, host); lookupErr == nil {
++		return nil
++	}
++
++	hint := "DNS lookup failed. Check network DNS or configure overrides via orchestrator.dns_servers / orchestrator.resolv_conf (EXPANSO_EDGE_ORCHESTRATOR_DNS_SERVERS / EXPANSO_EDGE_ORCHESTRATOR_RESOLV_CONF)."
++	natsErr := errors.Newf("unable to resolve NATS host '%s'", host).
++		WithCode(errors.CodeNetworkError).
++		WithHint(hint).
++		WithDetail("server_url", config.ServerURL)
++
++	if len(dnsServers) > 0 {
++		natsErr.WithDetail("dns_servers", strings.Join(dnsServers, ", "))
++	}
++	if config.DNSSource != "" {
++		natsErr.WithDetail("dns_source", config.DNSSource)
++	}
++
++	return natsErr
++}
++
++func extractNATSServerHost(serverURL string) string {
++	if serverURL == "" {
++		return ""
++	}
++
++	servers := strings.Split(serverURL, ",")
++	for _, entry := range servers {
++		entry = strings.TrimSpace(entry)
++		if entry == "" {
++			continue
++		}
++
++		parsed, err := url.Parse(entry)
++		if err == nil && parsed.Hostname() != "" {
++			return parsed.Hostname()
++		}
++
++		if host, _, err := net.SplitHostPort(entry); err == nil && host != "" {
++			return host
++		}
++	}
++
++	return ""
++}
+diff --git a/shared/transport/ncltransport/dns_override.go b/shared/transport/ncltransport/dns_override.go
+new file mode 100644
+index 0000000..9f319f6
+--- /dev/null
++++ b/shared/transport/ncltransport/dns_override.go
+@@ -0,0 +1,124 @@
++package ncltransport
++
++import (
++	"bufio"
++	"fmt"
++	"net"
++	"os"
++	"strings"
++
++	"github.com/expanso-io/expanso/lib/errors"
++	"github.com/expanso-io/expanso/types"
++)
++
++type dnsOverride struct {
++	servers []string
++	source  string
++}
++
++func resolveNATSDNSOverride(cfg types.ConnectionConfig) (dnsOverride, error) {
++	if len(cfg.DNSServers) > 0 {
++		servers := normalizeDNSServerList(cfg.DNSServers)
++		if len(servers) == 0 {
++			return dnsOverride{}, errors.New("NATS DNS override is empty").
++				WithCode(errors.CodeConfigurationError).
++				WithComponent("ncltransport").
++				WithHint("Provide at least one DNS server address")
++		}
++		return dnsOverride{servers: servers, source: "override"}, nil
++	}
++
++	if cfg.ResolvConf == "" {
++		return dnsOverride{}, nil
++	}
++
++	contents, err := os.ReadFile(cfg.ResolvConf)
++	if err != nil {
++		return dnsOverride{}, errors.Newf("failed to read resolv.conf override (%s)", cfg.ResolvConf).
++			WithCode(errors.CodeConfigurationError).
++			WithComponent("ncltransport").
++			WithHint("Check the resolv.conf path and file permissions")
++	}
++
++	servers := normalizeDNSServerList(parseResolvConf(string(contents)))
++	if len(servers) == 0 {
++		return dnsOverride{}, errors.Newf("no DNS servers found in %s", cfg.ResolvConf).
++			WithCode(errors.CodeConfigurationError).
++			WithComponent("ncltransport").
++			WithHint("Add at least one nameserver entry to the resolv.conf override")
++	}
++
++	return dnsOverride{servers: servers, source: fmt.Sprintf("resolv.conf:%s", cfg.ResolvConf)}, nil
++}
++
++func parseResolvConf(contents string) []string {
++	if contents == "" {
++		return nil
++	}
++
++	servers := []string{}
++	seen := map[string]struct{}{}
++	scanner := bufio.NewScanner(strings.NewReader(contents))
++	for scanner.Scan() {
++		line := strings.TrimSpace(scanner.Text())
++		if line == "" || strings.HasPrefix(line, "#") {
++			continue
++		}
++		fields := strings.Fields(line)
++		if len(fields) < 2 || fields[0] != "nameserver" {
++			continue
++		}
++		server := fields[1]
++		if _, ok := seen[server]; ok {
++			continue
++		}
++		seen[server] = struct{}{}
++		servers = append(servers, server)
++	}
++
++	return servers
++}
++
++func normalizeDNSServerList(servers []string) []string {
++	if len(servers) == 0 {
++		return nil
++	}
++
++	normalized := []string{}
++	seen := map[string]struct{}{}
++	for _, server := range servers {
++		server = strings.TrimSpace(server)
++		if server == "" {
++			continue
++		}
++		addr := normalizeDNSServerAddr(server)
++		if addr == "" {
++			continue
++		}
++		if _, ok := seen[addr]; ok {
++			continue
++		}
++		seen[addr] = struct{}{}
++		normalized = append(normalized, addr)
++	}
++	return normalized
++}
++
++func normalizeDNSServerAddr(server string) string {
++	if server == "" {
++		return ""
++	}
++	if host, port, err := net.SplitHostPort(server); err == nil {
++		if port == "" {
++			port = "53"
++		}
++		return net.JoinHostPort(host, port)
++	}
++	if ip := net.ParseIP(server); ip != nil {
++		return net.JoinHostPort(server, "53")
++	}
++	if strings.Count(server, ":") >= 2 {
++		return net.JoinHostPort(server, "53")
++	}
++	return net.JoinHostPort(server, "53")
++}
+diff --git a/shared/transport/ncltransport/dns_override_test.go b/shared/transport/ncltransport/dns_override_test.go
+new file mode 100644
+index 0000000..98159ed
+--- /dev/null
++++ b/shared/transport/ncltransport/dns_override_test.go
+@@ -0,0 +1,47 @@
++package ncltransport
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/expanso-io/expanso/types"
++	"github.com/stretchr/testify/require"
++)
++
++func TestResolveNATSDNSOverride_UsesExplicitServers(t *testing.T) {
++	cfg := types.ConnectionConfig{
++		DNSServers: []string{"8.8.8.8", " 1.1.1.1 ", "8.8.8.8"},
++		ResolvConf: "/should/not/use",
++	}
++
++	override, err := resolveNATSDNSOverride(cfg)
++	require.NoError(t, err)
++	require.Equal(t, []string{"8.8.8.8:53", "1.1.1.1:53"}, override.servers)
++	require.Equal(t, "override", override.source)
++}
++
++func TestResolveNATSDNSOverride_ResolvConf(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "resolv.conf")
++	err := os.WriteFile(path, []byte("nameserver 9.9.9.9\nnameserver 2620:fe::fe\n"), 0o644)
++	require.NoError(t, err)
++
++	cfg := types.ConnectionConfig{
++		ResolvConf: path,
++	}
++
++	override, err := resolveNATSDNSOverride(cfg)
++	require.NoError(t, err)
++	require.Equal(t, []string{"9.9.9.9:53", "[2620:fe::fe]:53"}, override.servers)
++	require.Equal(t, "resolv.conf:"+path, override.source)
++}
++
++func TestResolveNATSDNSOverride_ResolvConfMissing(t *testing.T) {
++	cfg := types.ConnectionConfig{
++		ResolvConf: "/missing/resolv.conf",
++	}
++
++	_, err := resolveNATSDNSOverride(cfg)
++	require.Error(t, err)
++}
+diff --git a/shared/transport/ncltransport/edge.go b/shared/transport/ncltransport/edge.go
+index 5a71a62..19975d9 100644
+--- a/shared/transport/ncltransport/edge.go
++++ b/shared/transport/ncltransport/edge.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"log/slog"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+@@ -139,13 +140,26 @@ func (t *EdgeTransport) Connect(ctx context.Context) (transport.EdgeConnection,
+ 			"server_url", serverURL)
+ 	}
+ 
++	dnsOverride, err := resolveNATSDNSOverride(creds)
++	if err != nil {
++		return nil, err
++	}
++	if len(dnsOverride.servers) > 0 {
++		t.logger.Info("Using DNS override for NATS connection",
++			"servers", strings.Join(dnsOverride.servers, ", "),
++			"source", dnsOverride.source)
++	}
++
+ 	nc, err := CreateNATSClient(ClientConfig{
+-		Name:       nodeID,
+-		ServerURL:  serverURL,
+-		CredsFile:  creds.CredentialsPath, // Empty string is handled gracefully by CreateNATSClient
+-		RequireTLS: creds.RequireTLS,
+-		CACerts:    creds.CACerts,
+-		Logger:     t.logger,
++		Name:        nodeID,
++		ServerURL:   serverURL,
++		CredsFile:   creds.CredentialsPath, // Empty string is handled gracefully by CreateNATSClient
++		RequireTLS:  creds.RequireTLS,
++		CACerts:     creds.CACerts,
++		Logger:      t.logger,
++		PreferGoDNS: len(dnsOverride.servers) > 0,
++		DNSServers:  dnsOverride.servers,
++		DNSSource:   dnsOverride.source,
+ 	})
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to connect to NATS server: %w", err)
+diff --git a/shared/transport/ncltransport/orchestrator.go b/shared/transport/ncltransport/orchestrator.go
+index 9c09153..baab9cd 100644
+--- a/shared/transport/ncltransport/orchestrator.go
++++ b/shared/transport/ncltransport/orchestrator.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"log/slog"
++	"strings"
+ 	"sync"
+ 
+ 	"github.com/expanso-io/expanso/lib/envelope"
+@@ -147,11 +148,24 @@ func (t *OrchestratorTransport) Start(ctx context.Context) error {
+ 			"server_url", serverURL)
+ 	}
+ 
++	dnsOverride, err := resolveNATSDNSOverride(connConfig)
++	if err != nil {
++		return err
++	}
++	if len(dnsOverride.servers) > 0 {
++		t.logger.Info("Using DNS override for NATS connection",
++			"servers", strings.Join(dnsOverride.servers, ", "),
++			"source", dnsOverride.source)
++	}
++
+ 	nc, err := CreateNATSClient(ClientConfig{
+-		Name:      nodeID,
+-		ServerURL: serverURL,
+-		CredsFile: credsFile,
+-		Logger:    t.logger,
++		Name:        nodeID,
++		ServerURL:   serverURL,
++		CredsFile:   credsFile,
++		Logger:      t.logger,
++		PreferGoDNS: len(dnsOverride.servers) > 0,
++		DNSServers:  dnsOverride.servers,
++		DNSSource:   dnsOverride.source,
+ 	})
+ 	if err != nil {
+ 		return fmt.Errorf("failed to connect to NATS: %w", err)
+diff --git a/types/config_edge.go b/types/config_edge.go
+index d2d9086..44a0145 100644
+--- a/types/config_edge.go
++++ b/types/config_edge.go
+@@ -335,6 +335,14 @@ type EdgeOrchestratorConfig struct {
+ 	// IMPACT:
+ 	// Disables all control plane authentication. For development/testing only.
+ 	Insecure bool `json:"insecure,omitempty" yaml:"insecure,omitempty"`
++
++	// DNSServers overrides DNS servers used for NATS connections.
++	// Example: ["8.8.8.8", "1.1.1.1"]
++	DNSServers []string `json:"dns_servers,omitempty" yaml:"dns_servers,omitempty"`
++
++	// ResolvConf points to a resolv.conf file to derive DNS servers for NATS connections.
++	// Use when the system resolver is incorrect or inaccessible.
++	ResolvConf string `json:"resolv_conf,omitempty" yaml:"resolv_conf,omitempty"`
+ }
+ 
+ // Validate performs validation on the configuration
+@@ -522,5 +530,7 @@ func (c *EdgeConfig) GetConnectionConfig() ConnectionConfig {
+ 		RefreshAddress:  c.Orchestrator.RefreshAddress,
+ 		RequireTLS:      c.Orchestrator.RequireTLS,
+ 		Insecure:        c.Orchestrator.Insecure,
++		DNSServers:      c.Orchestrator.DNSServers,
++		ResolvConf:      c.Orchestrator.ResolvConf,
+ 	}
+ }
+diff --git a/types/connection.go b/types/connection.go
+index dfba993..3c80827 100644
+--- a/types/connection.go
++++ b/types/connection.go
+@@ -4,14 +4,16 @@ import "github.com/expanso-io/expanso/lib/validate"
+ 
+ // ConnectionConfig contains all credential information for NATS connection
+ type ConnectionConfig struct {
+-	NodeID          string `json:"node_id,omitempty" yaml:"node_id,omitempty"`
+-	NetworkID       string `json:"network_id,omitempty" yaml:"network_id,omitempty"`
+-	CredentialsPath string `json:"credentials_path,omitempty" yaml:"credentials_path,omitempty"`
+-	Address         string `json:"address,omitempty" yaml:"address,omitempty"`
+-	RefreshAddress  string `json:"refresh_address,omitempty" yaml:"refresh_address,omitempty"`
+-	RequireTLS      bool   `json:"require_tls,omitempty" yaml:"require_tls,omitempty"`
+-	Insecure        bool   `json:"insecure,omitempty" yaml:"insecure,omitempty"`
+-	CACerts         string `json:"ca_certs,omitempty" yaml:"ca_certs,omitempty"` // PEM-encoded CA certificates to trust for NATS connection
++	NodeID          string   `json:"node_id,omitempty" yaml:"node_id,omitempty"`
++	NetworkID       string   `json:"network_id,omitempty" yaml:"network_id,omitempty"`
++	CredentialsPath string   `json:"credentials_path,omitempty" yaml:"credentials_path,omitempty"`
++	Address         string   `json:"address,omitempty" yaml:"address,omitempty"`
++	RefreshAddress  string   `json:"refresh_address,omitempty" yaml:"refresh_address,omitempty"`
++	RequireTLS      bool     `json:"require_tls,omitempty" yaml:"require_tls,omitempty"`
++	Insecure        bool     `json:"insecure,omitempty" yaml:"insecure,omitempty"`
++	CACerts         string   `json:"ca_certs,omitempty" yaml:"ca_certs,omitempty"`       // PEM-encoded CA certificates to trust for NATS connection
++	DNSServers      []string `json:"dns_servers,omitempty" yaml:"dns_servers,omitempty"` // Optional DNS servers override for NATS connection
++	ResolvConf      string   `json:"resolv_conf,omitempty" yaml:"resolv_conf,omitempty"` // Optional resolv.conf path to derive DNS servers for NATS connection
+ }
+ 
+ // Validate validates the connection configuration
+diff --git a/types/telemetry.go b/types/telemetry.go
+index ff343b0..d3c87ea 100644
+--- a/types/telemetry.go
++++ b/types/telemetry.go
+@@ -60,6 +60,14 @@ type TelemetryConfig struct {
+ 	// Example: ["db.", "ncl."] to drop all db.* and ncl.* metrics
+ 	DropMetricPrefixes []string `json:"drop_metric_prefixes,omitempty" yaml:"drop_metric_prefixes,omitempty" `
+ 
++	// DNSServers overrides DNS servers used for telemetry exporters (HTTP protocol only).
++	// Example: ["8.8.8.8", "1.1.1.1"]
++	DNSServers []string `json:"dns_servers,omitempty" yaml:"dns_servers,omitempty" `
++
++	// ResolvConf points to a resolv.conf file to derive DNS servers for telemetry exporters.
++	// Only applies to HTTP protocol exporters.
++	ResolvConf string `json:"resolv_conf,omitempty" yaml:"resolv_conf,omitempty" `
++
+ 	// Optional authentication configuration for telemetry exporters
+ 	Authentication *TelemetryAuthenticationConfig `json:"authentication,omitempty" yaml:"authentication,omitempty" `
+ }
+-- 
+2.52.0
+
