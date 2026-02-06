@@ -45,7 +45,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-MODCACHE_DIR="$WORK_DIR/gomodcache"
+if [[ -n "${GOMODCACHE:-}" ]]; then
+  MODCACHE_DIR="$GOMODCACHE"
+elif [[ -n "${EXPANSO_GOMODCACHE:-}" ]]; then
+  MODCACHE_DIR="$EXPANSO_GOMODCACHE"
+else
+  MODCACHE_DIR="$WORK_DIR/gomodcache"
+fi
 export GOMODCACHE="$MODCACHE_DIR"
 
 SRC_DIR="$WORK_DIR/expanso"
