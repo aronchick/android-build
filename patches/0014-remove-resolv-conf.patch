@@ -1,0 +1,663 @@
+From bab470338e54061b6a19e6e5b2dde916f00c2325 Mon Sep 17 00:00:00 2001
+From: David Aronchick <aronchick@gmail.com>
+Date: Fri, 6 Feb 2026 09:37:36 -0800
+Subject: [PATCH] fix: remove resolv.conf dns overrides
+
+---
+ edge/cmd/commands/bootstrap.go                |  7 +--
+ edge/cmd/commands/run.go                      |  7 +--
+ edge/cmd/flags/service.go                     | 21 --------
+ edge/cmd/flags/service_test.go                | 42 ---------------
+ shared/bootstrap/dns_override.go              | 25 +--------
+ shared/bootstrap/service.go                   |  1 -
+ shared/bootstrap/types.go                     |  3 --
+ shared/telemetry/dns_override.go              | 51 +-----------------
+ shared/transport/ncltransport/client.go       |  2 +-
+ shared/transport/ncltransport/dns_override.go | 54 +------------------
+ .../ncltransport/dns_override_test.go         | 29 ++--------
+ types/config_edge.go                          | 21 +++-----
+ types/connection.go                           |  1 -
+ types/dns.go                                  | 11 +---
+ types/telemetry.go                            |  5 +-
+ 15 files changed, 18 insertions(+), 262 deletions(-)
+
+diff --git a/edge/cmd/commands/bootstrap.go b/edge/cmd/commands/bootstrap.go
+index 2cf38b8..e697ecd 100644
+--- a/edge/cmd/commands/bootstrap.go
++++ b/edge/cmd/commands/bootstrap.go
+@@ -25,7 +25,6 @@ type bootstrapConfig struct {
+ 	NoProxy        bool
+ 	ForceIPv4      bool
+ 	DNSServers     string
+-	ResolvConf     string
+ }
+ 
+ // NewBootstrapCommand creates the bootstrap command
+@@ -102,7 +101,6 @@ Examples:
+ 	cmd.Flags().BoolVar(&cfg.NoProxy, "no-proxy", false, "Disable HTTP proxy usage for bootstrap requests")
+ 	cmd.Flags().BoolVar(&cfg.ForceIPv4, "force-ipv4", false, "Force IPv4 for bootstrap requests (useful on networks with broken IPv6)")
+ 	cmd.Flags().StringVar(&cfg.DNSServers, "dns-servers", "", "Override DNS servers for bootstrap (comma-separated)")
+-	cmd.Flags().StringVar(&cfg.ResolvConf, "resolv-conf", "", "Use DNS servers from a specific resolv.conf file for bootstrap")
+ 
+ 	cmd.PersistentFlags().StringSliceVarP(&cfg.ConfigPaths, "config", "c", nil, "Paths to configuration files or directories")
+ 	cmd.Flags().StringVar(&cfg.DataDir, "data-dir", "", "Data directory path")
+@@ -144,11 +142,9 @@ func runBootstrap(cmd *cobra.Command, cfg *bootstrapConfig) error {
+ 	disableProxy := flags.ResolveBootstrapNoProxy(cfg.NoProxy)
+ 	forceIPv4 := flags.ResolveBootstrapForceIPv4(cfg.ForceIPv4)
+ 	dnsServers := flags.ResolveBootstrapDNSServers(cfg.DNSServers)
+-	resolvConf := flags.ResolveBootstrapResolvConf(cfg.ResolvConf)
+-	if len(dnsServers) == 0 && resolvConf == "" {
++	if len(dnsServers) == 0 {
+ 		dns := currentCfg.GetDNSConfig()
+ 		dnsServers = dns.Servers
+-		resolvConf = dns.ResolvConf
+ 	}
+ 	_, err = bootstrapService.Bootstrap(ctx, bootstrap.BootstrapOptions{
+ 		Token:        token,
+@@ -158,7 +154,6 @@ func runBootstrap(cmd *cobra.Command, cfg *bootstrapConfig) error {
+ 		DisableProxy: disableProxy,
+ 		ForceIPv4:    forceIPv4,
+ 		DNSServers:   dnsServers,
+-		ResolvConf:   resolvConf,
+ 		Verbose:      verbose,
+ 	})
+ 	if err != nil {
+diff --git a/edge/cmd/commands/run.go b/edge/cmd/commands/run.go
+index afc8664..9c38fba 100644
+--- a/edge/cmd/commands/run.go
++++ b/edge/cmd/commands/run.go
+@@ -105,7 +105,6 @@ func runServiceDirectly(cmd *cobra.Command, cfg *flags.ServiceRunConfig) error {
+ 		cfg.GetBootstrapNoProxy(),
+ 		cfg.GetBootstrapForceIPv4(),
+ 		cfg.GetBootstrapDNSServers(),
+-		cfg.GetBootstrapResolvConf(),
+ 		verbose,
+ 		configManager,
+ 	); err != nil {
+@@ -179,7 +178,6 @@ func runWithSupervisor(cmd *cobra.Command, cfg *flags.ServiceRunConfig) error {
+ 		cfg.GetBootstrapNoProxy(),
+ 		cfg.GetBootstrapForceIPv4(),
+ 		cfg.GetBootstrapDNSServers(),
+-		cfg.GetBootstrapResolvConf(),
+ 		verbose,
+ 		configManager,
+ 	); err != nil {
+@@ -249,7 +247,6 @@ func ensureRegistered(
+ 	disableProxy bool,
+ 	forceIPv4 bool,
+ 	dnsServers []string,
+-	resolvConf string,
+ 	verbose bool,
+ 	configManager interfaces.EdgeConfigManager,
+ ) error {
+@@ -260,10 +257,9 @@ func ensureRegistered(
+ 		return nil
+ 	}
+ 
+-	if len(dnsServers) == 0 && resolvConf == "" {
++	if len(dnsServers) == 0 {
+ 		dns := edgeCfg.GetDNSConfig()
+ 		dnsServers = dns.Servers
+-		resolvConf = dns.ResolvConf
+ 	}
+ 
+ 	// Not in local mode - attempt bootstrap
+@@ -275,7 +271,6 @@ func ensureRegistered(
+ 		DisableProxy: disableProxy,
+ 		ForceIPv4:    forceIPv4,
+ 		DNSServers:   dnsServers,
+-		ResolvConf:   resolvConf,
+ 		Verbose:      verbose,
+ 	})
+ 	if err != nil {
+diff --git a/edge/cmd/flags/service.go b/edge/cmd/flags/service.go
+index 168517f..cfcaebb 100644
+--- a/edge/cmd/flags/service.go
++++ b/edge/cmd/flags/service.go
+@@ -16,7 +16,6 @@ const (
+ 	EnvBootstrapNoProxy    = "EXPANSO_EDGE_BOOTSTRAP_NO_PROXY"
+ 	EnvBootstrapForceIPv4  = "EXPANSO_EDGE_BOOTSTRAP_FORCE_IPV4"
+ 	EnvBootstrapDNSServers = "EXPANSO_EDGE_BOOTSTRAP_DNS_SERVERS"
+-	EnvBootstrapResolvConf = "EXPANSO_EDGE_BOOTSTRAP_RESOLV_CONF"
+ )
+ 
+ const (
+@@ -80,14 +79,6 @@ func ResolveBootstrapDNSServers(cliValue string) []string {
+ 	return splitCSV(envValue)
+ }
+ 
+-// ResolveBootstrapResolvConf returns resolv.conf override path, preferring CLI over env
+-func ResolveBootstrapResolvConf(cliValue string) string {
+-	if cliValue != "" {
+-		return cliValue
+-	}
+-	return os.Getenv(EnvBootstrapResolvConf)
+-}
+-
+ func splitCSV(value string) []string {
+ 	if value == "" {
+ 		return nil
+@@ -127,7 +118,6 @@ type ServiceConfig struct {
+ 	BootstrapNoProxy    bool
+ 	BootstrapForceIPv4  bool
+ 	BootstrapDNSServers string
+-	BootstrapResolvConf string
+ 
+ 	// Convenience flags
+ 	LocalMode bool
+@@ -163,11 +153,6 @@ func (c *ServiceConfig) GetBootstrapDNSServers() []string {
+ 	return ResolveBootstrapDNSServers(c.BootstrapDNSServers)
+ }
+ 
+-// GetBootstrapResolvConf returns bootstrap resolv.conf override path
+-func (c *ServiceConfig) GetBootstrapResolvConf() string {
+-	return ResolveBootstrapResolvConf(c.BootstrapResolvConf)
+-}
+-
+ // ServiceRunConfig holds all configuration for the service run command
+ type ServiceRunConfig struct {
+ 	ServiceConfig
+@@ -227,12 +212,6 @@ func AddServiceConfigFlags(cmd *cobra.Command, cfg *ServiceConfig) {
+ 		"",
+ 		"Override bootstrap DNS servers (comma-separated)",
+ 	)
+-	cmd.Flags().StringVar(
+-		&cfg.BootstrapResolvConf,
+-		"bootstrap-resolv-conf",
+-		"",
+-		"Use DNS servers from a specific resolv.conf file for bootstrap",
+-	)
+ 
+ 	// Convenience flags
+ 	cmd.Flags().BoolVar(&cfg.LocalMode, "local", false, "Run in local mode (no control plane connection)")
+diff --git a/edge/cmd/flags/service_test.go b/edge/cmd/flags/service_test.go
+index 4c85243..2e39f4b 100644
+--- a/edge/cmd/flags/service_test.go
++++ b/edge/cmd/flags/service_test.go
+@@ -253,45 +253,3 @@ func TestResolveBootstrapDNSServers(t *testing.T) {
+ 		})
+ 	}
+ }
+-
+-func TestResolveBootstrapResolvConf(t *testing.T) {
+-	tests := []struct {
+-		name     string
+-		cliValue string
+-		envValue string
+-		expected string
+-	}{
+-		{
+-			name:     "CLI overrides env",
+-			cliValue: "/tmp/override.conf",
+-			envValue: "/etc/resolv.conf",
+-			expected: "/tmp/override.conf",
+-		},
+-		{
+-			name:     "Env used when CLI empty",
+-			cliValue: "",
+-			envValue: "/etc/resolv.conf",
+-			expected: "/etc/resolv.conf",
+-		},
+-		{
+-			name:     "Empty when both unset",
+-			cliValue: "",
+-			envValue: "",
+-			expected: "",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			if tt.envValue != "" {
+-				os.Setenv(EnvBootstrapResolvConf, tt.envValue)
+-				defer os.Unsetenv(EnvBootstrapResolvConf)
+-			} else {
+-				os.Unsetenv(EnvBootstrapResolvConf)
+-			}
+-
+-			result := ResolveBootstrapResolvConf(tt.cliValue)
+-			assert.Equal(t, tt.expected, result)
+-		})
+-	}
+-}
+diff --git a/shared/bootstrap/dns_override.go b/shared/bootstrap/dns_override.go
+index 5566f30..1cbfd0a 100644
+--- a/shared/bootstrap/dns_override.go
++++ b/shared/bootstrap/dns_override.go
+@@ -1,8 +1,6 @@
+ package bootstrap
+ 
+ import (
+-	"fmt"
+-	"os"
+ 	"strings"
+ 
+ 	"github.com/expanso-io/expanso/lib/errors"
+@@ -24,28 +22,7 @@ func resolveBootstrapDNSServers(opts BootstrapOptions) (dnsOverride, error) {
+ 		}
+ 		return dnsOverride{servers: servers, source: "override"}, nil
+ 	}
+-
+-	if opts.ResolvConf == "" {
+-		return dnsOverride{}, nil
+-	}
+-
+-	contents, err := os.ReadFile(opts.ResolvConf)
+-	if err != nil {
+-		return dnsOverride{}, errors.Newf("failed to read resolv.conf override (%s)", opts.ResolvConf).
+-			WithCode(errors.CodeBadRequest).
+-			WithComponent("BootstrapService").
+-			WithHint("Check the resolv.conf path and file permissions")
+-	}
+-
+-	servers := normalizeServerList(parseResolvConf(string(contents)))
+-	if len(servers) == 0 {
+-		return dnsOverride{}, errors.Newf("no DNS servers found in %s", opts.ResolvConf).
+-			WithCode(errors.CodeBadRequest).
+-			WithComponent("BootstrapService").
+-			WithHint("Add at least one nameserver entry to the resolv.conf override")
+-	}
+-
+-	return dnsOverride{servers: servers, source: fmt.Sprintf("resolv.conf:%s", opts.ResolvConf)}, nil
++	return dnsOverride{}, nil
+ }
+ 
+ func normalizeServerList(servers []string) []string {
+diff --git a/shared/bootstrap/service.go b/shared/bootstrap/service.go
+index b25a717..9e5c929 100644
+--- a/shared/bootstrap/service.go
++++ b/shared/bootstrap/service.go
+@@ -159,7 +159,6 @@ func (s *BootstrapService) EnsureBootstrapped(ctx context.Context, opts Bootstra
+ 		DisableProxy: opts.DisableProxy,
+ 		ForceIPv4:    opts.ForceIPv4,
+ 		DNSServers:   opts.DNSServers,
+-		ResolvConf:   opts.ResolvConf,
+ 		Verbose:      opts.Verbose,
+ 	})
+ 	if err != nil {
+diff --git a/shared/bootstrap/types.go b/shared/bootstrap/types.go
+index 838adce..d1a11a2 100644
+--- a/shared/bootstrap/types.go
++++ b/shared/bootstrap/types.go
+@@ -40,9 +40,6 @@ type BootstrapOptions struct {
+ 	// DNSServers overrides DNS resolution for bootstrap requests
+ 	DNSServers []string
+ 
+-	// ResolvConf overrides the resolv.conf path used to derive DNS servers for bootstrap
+-	ResolvConf string
+-
+ 	// Verbose enables verbose diagnostics for bootstrap failures
+ 	Verbose bool
+ }
+diff --git a/shared/telemetry/dns_override.go b/shared/telemetry/dns_override.go
+index 57bace6..d69d84b 100644
+--- a/shared/telemetry/dns_override.go
++++ b/shared/telemetry/dns_override.go
+@@ -1,12 +1,10 @@
+ package telemetry
+ 
+ import (
+-	"bufio"
+ 	"context"
+ 	"net"
+ 	"net/http"
+ 	"net/url"
+-	"os"
+ 	"strings"
+ 
+ 	"github.com/expanso-io/expanso/lib/errors"
+@@ -34,28 +32,7 @@ func resolveTelemetryDNSOverride(cfg *types.TelemetryConfig) (telemetryDNSOverri
+ 		}
+ 		return telemetryDNSOverride{servers: servers, source: "override"}, nil
+ 	}
+-
+-	if cfg.ResolvConf == "" {
+-		return telemetryDNSOverride{}, nil
+-	}
+-
+-	contents, err := os.ReadFile(cfg.ResolvConf)
+-	if err != nil {
+-		return telemetryDNSOverride{}, errors.Newf("failed to read resolv.conf override (%s)", cfg.ResolvConf).
+-			WithCode(errors.CodeConfigurationError).
+-			WithComponent("telemetry").
+-			WithHint("Check the resolv.conf path and file permissions")
+-	}
+-
+-	servers := normalizeTelemetryDNSServerList(parseTelemetryResolvConf(string(contents)))
+-	if len(servers) == 0 {
+-		return telemetryDNSOverride{}, errors.Newf("no DNS servers found in %s", cfg.ResolvConf).
+-			WithCode(errors.CodeConfigurationError).
+-			WithComponent("telemetry").
+-			WithHint("Add at least one nameserver entry to the resolv.conf override")
+-	}
+-
+-	return telemetryDNSOverride{servers: servers, source: "resolv.conf:" + cfg.ResolvConf}, nil
++	return telemetryDNSOverride{}, nil
+ }
+ 
+ func buildTelemetryHTTPClient(cfg *types.TelemetryConfig, logger *slog.Logger) (*http.Client, error) {
+@@ -164,32 +141,6 @@ func telemetryDNSNetwork(network string) string {
+ 	}
+ }
+ 
+-func parseTelemetryResolvConf(contents string) []string {
+-	if contents == "" {
+-		return nil
+-	}
+-	servers := []string{}
+-	seen := map[string]struct{}{}
+-	scanner := bufio.NewScanner(strings.NewReader(contents))
+-	for scanner.Scan() {
+-		line := strings.TrimSpace(scanner.Text())
+-		if line == "" || strings.HasPrefix(line, "#") {
+-			continue
+-		}
+-		fields := strings.Fields(line)
+-		if len(fields) < 2 || fields[0] != "nameserver" {
+-			continue
+-		}
+-		server := fields[1]
+-		if _, ok := seen[server]; ok {
+-			continue
+-		}
+-		seen[server] = struct{}{}
+-		servers = append(servers, server)
+-	}
+-	return servers
+-}
+-
+ func normalizeTelemetryDNSServerList(servers []string) []string {
+ 	if len(servers) == 0 {
+ 		return nil
+diff --git a/shared/transport/ncltransport/client.go b/shared/transport/ncltransport/client.go
+index ecc218f..a03962e 100644
+--- a/shared/transport/ncltransport/client.go
++++ b/shared/transport/ncltransport/client.go
+@@ -256,7 +256,7 @@ func classifyNATSDNSError(err error, config ClientConfig, dnsServers []string, r
+ 		return nil
+ 	}
+ 
+-	hint := "DNS lookup failed. Check network DNS or configure overrides via dns.servers / dns.resolv_conf (EXPANSO_EDGE_DNS_SERVERS / EXPANSO_EDGE_DNS_RESOLV_CONF)."
++	hint := "DNS lookup failed. Check network DNS or configure overrides via dns.servers (EXPANSO_EDGE_DNS_SERVERS)."
+ 	natsErr := errors.Newf("unable to resolve NATS host '%s'", host).
+ 		WithCode(errors.CodeNetworkError).
+ 		WithHint(hint).
+diff --git a/shared/transport/ncltransport/dns_override.go b/shared/transport/ncltransport/dns_override.go
+index 9f319f6..d5231f8 100644
+--- a/shared/transport/ncltransport/dns_override.go
++++ b/shared/transport/ncltransport/dns_override.go
+@@ -1,10 +1,7 @@
+ package ncltransport
+ 
+ import (
+-	"bufio"
+-	"fmt"
+ 	"net"
+-	"os"
+ 	"strings"
+ 
+ 	"github.com/expanso-io/expanso/lib/errors"
+@@ -27,56 +24,7 @@ func resolveNATSDNSOverride(cfg types.ConnectionConfig) (dnsOverride, error) {
+ 		}
+ 		return dnsOverride{servers: servers, source: "override"}, nil
+ 	}
+-
+-	if cfg.ResolvConf == "" {
+-		return dnsOverride{}, nil
+-	}
+-
+-	contents, err := os.ReadFile(cfg.ResolvConf)
+-	if err != nil {
+-		return dnsOverride{}, errors.Newf("failed to read resolv.conf override (%s)", cfg.ResolvConf).
+-			WithCode(errors.CodeConfigurationError).
+-			WithComponent("ncltransport").
+-			WithHint("Check the resolv.conf path and file permissions")
+-	}
+-
+-	servers := normalizeDNSServerList(parseResolvConf(string(contents)))
+-	if len(servers) == 0 {
+-		return dnsOverride{}, errors.Newf("no DNS servers found in %s", cfg.ResolvConf).
+-			WithCode(errors.CodeConfigurationError).
+-			WithComponent("ncltransport").
+-			WithHint("Add at least one nameserver entry to the resolv.conf override")
+-	}
+-
+-	return dnsOverride{servers: servers, source: fmt.Sprintf("resolv.conf:%s", cfg.ResolvConf)}, nil
+-}
+-
+-func parseResolvConf(contents string) []string {
+-	if contents == "" {
+-		return nil
+-	}
+-
+-	servers := []string{}
+-	seen := map[string]struct{}{}
+-	scanner := bufio.NewScanner(strings.NewReader(contents))
+-	for scanner.Scan() {
+-		line := strings.TrimSpace(scanner.Text())
+-		if line == "" || strings.HasPrefix(line, "#") {
+-			continue
+-		}
+-		fields := strings.Fields(line)
+-		if len(fields) < 2 || fields[0] != "nameserver" {
+-			continue
+-		}
+-		server := fields[1]
+-		if _, ok := seen[server]; ok {
+-			continue
+-		}
+-		seen[server] = struct{}{}
+-		servers = append(servers, server)
+-	}
+-
+-	return servers
++	return dnsOverride{}, nil
+ }
+ 
+ func normalizeDNSServerList(servers []string) []string {
+diff --git a/shared/transport/ncltransport/dns_override_test.go b/shared/transport/ncltransport/dns_override_test.go
+index 98159ed..8960586 100644
+--- a/shared/transport/ncltransport/dns_override_test.go
++++ b/shared/transport/ncltransport/dns_override_test.go
+@@ -1,8 +1,6 @@
+ package ncltransport
+ 
+ import (
+-	"os"
+-	"path/filepath"
+ 	"testing"
+ 
+ 	"github.com/expanso-io/expanso/types"
+@@ -12,7 +10,6 @@ import (
+ func TestResolveNATSDNSOverride_UsesExplicitServers(t *testing.T) {
+ 	cfg := types.ConnectionConfig{
+ 		DNSServers: []string{"8.8.8.8", " 1.1.1.1 ", "8.8.8.8"},
+-		ResolvConf: "/should/not/use",
+ 	}
+ 
+ 	override, err := resolveNATSDNSOverride(cfg)
+@@ -20,28 +17,8 @@ func TestResolveNATSDNSOverride_UsesExplicitServers(t *testing.T) {
+ 	require.Equal(t, []string{"8.8.8.8:53", "1.1.1.1:53"}, override.servers)
+ 	require.Equal(t, "override", override.source)
+ }
+-
+-func TestResolveNATSDNSOverride_ResolvConf(t *testing.T) {
+-	dir := t.TempDir()
+-	path := filepath.Join(dir, "resolv.conf")
+-	err := os.WriteFile(path, []byte("nameserver 9.9.9.9\nnameserver 2620:fe::fe\n"), 0o644)
+-	require.NoError(t, err)
+-
+-	cfg := types.ConnectionConfig{
+-		ResolvConf: path,
+-	}
+-
+-	override, err := resolveNATSDNSOverride(cfg)
++func TestResolveNATSDNSOverride_Empty(t *testing.T) {
++	override, err := resolveNATSDNSOverride(types.ConnectionConfig{})
+ 	require.NoError(t, err)
+-	require.Equal(t, []string{"9.9.9.9:53", "[2620:fe::fe]:53"}, override.servers)
+-	require.Equal(t, "resolv.conf:"+path, override.source)
+-}
+-
+-func TestResolveNATSDNSOverride_ResolvConfMissing(t *testing.T) {
+-	cfg := types.ConnectionConfig{
+-		ResolvConf: "/missing/resolv.conf",
+-	}
+-
+-	_, err := resolveNATSDNSOverride(cfg)
+-	require.Error(t, err)
++	require.Empty(t, override.servers)
+ }
+diff --git a/types/config_edge.go b/types/config_edge.go
+index 6f78202..d311ba2 100644
+--- a/types/config_edge.go
++++ b/types/config_edge.go
+@@ -347,12 +347,9 @@ type EdgeOrchestratorConfig struct {
+ 	// Disables all control plane authentication. For development/testing only.
+ 	Insecure bool `json:"insecure,omitempty" yaml:"insecure,omitempty"`
+ 
+-	// Deprecated: use top-level dns.servers/resolv_conf instead.
++	// Deprecated: use top-level dns.servers instead.
+ 	// Example: ["8.8.8.8", "1.1.1.1"]
+ 	DNSServers []string `json:"dns_servers,omitempty" yaml:"dns_servers,omitempty"`
+-
+-	// Deprecated: use top-level dns.servers/resolv_conf instead.
+-	ResolvConf string `json:"resolv_conf,omitempty" yaml:"resolv_conf,omitempty"`
+ }
+ 
+ // Validate performs validation on the configuration
+@@ -406,16 +403,14 @@ func (c *EdgeConfig) validateDNSOverrides() error {
+ 	}
+ 	if c.Orchestrator != nil {
+ 		legacy := DNSConfig{
+-			Servers:    c.Orchestrator.DNSServers,
+-			ResolvConf: c.Orchestrator.ResolvConf,
++			Servers: c.Orchestrator.DNSServers,
+ 		}
+ 		if !legacy.IsEmpty() {
+ 			configs["orchestrator"] = legacy
+ 		}
+ 	}
+ 	legacyTelemetry := DNSConfig{
+-		Servers:    c.Telemetry.DNSServers,
+-		ResolvConf: c.Telemetry.ResolvConf,
++		Servers: c.Telemetry.DNSServers,
+ 	}
+ 	if !legacyTelemetry.IsEmpty() {
+ 		configs["telemetry"] = legacyTelemetry
+@@ -436,7 +431,7 @@ func (c *EdgeConfig) validateDNSOverrides() error {
+ 		if !base.Equals(cfg) {
+ 			return errors.Newf("dns overrides must match across dns/orchestrator/telemetry (mismatch between %s and %s)", baseKey, key).
+ 				WithCode(errors.CodeValidation).
+-				WithHint("Set only dns.servers/resolv_conf or ensure all overrides are identical")
++				WithHint("Set only dns.servers or ensure all overrides are identical")
+ 		}
+ 	}
+ 
+@@ -573,7 +568,6 @@ func (c *EdgeConfig) GetTelemetryConfig() *TelemetryConfig {
+ 	cfg := c.Telemetry
+ 	if dns := c.GetDNSConfig(); !dns.IsEmpty() {
+ 		cfg.DNSServers = dns.Servers
+-		cfg.ResolvConf = dns.ResolvConf
+ 	}
+ 	return &cfg
+ }
+@@ -585,16 +579,14 @@ func (c *EdgeConfig) GetDNSConfig() DNSConfig {
+ 	}
+ 	if c.Orchestrator != nil {
+ 		legacy := DNSConfig{
+-			Servers:    c.Orchestrator.DNSServers,
+-			ResolvConf: c.Orchestrator.ResolvConf,
++			Servers: c.Orchestrator.DNSServers,
+ 		}
+ 		if !legacy.IsEmpty() {
+ 			return legacy
+ 		}
+ 	}
+ 	legacy := DNSConfig{
+-		Servers:    c.Telemetry.DNSServers,
+-		ResolvConf: c.Telemetry.ResolvConf,
++		Servers: c.Telemetry.DNSServers,
+ 	}
+ 	if !legacy.IsEmpty() {
+ 		return legacy
+@@ -617,6 +609,5 @@ func (c *EdgeConfig) GetConnectionConfig() ConnectionConfig {
+ 		RequireTLS:      c.Orchestrator.RequireTLS,
+ 		Insecure:        c.Orchestrator.Insecure,
+ 		DNSServers:      dns.Servers,
+-		ResolvConf:      dns.ResolvConf,
+ 	}
+ }
+diff --git a/types/connection.go b/types/connection.go
+index 3c80827..c704b47 100644
+--- a/types/connection.go
++++ b/types/connection.go
+@@ -13,7 +13,6 @@ type ConnectionConfig struct {
+ 	Insecure        bool     `json:"insecure,omitempty" yaml:"insecure,omitempty"`
+ 	CACerts         string   `json:"ca_certs,omitempty" yaml:"ca_certs,omitempty"`       // PEM-encoded CA certificates to trust for NATS connection
+ 	DNSServers      []string `json:"dns_servers,omitempty" yaml:"dns_servers,omitempty"` // Optional DNS servers override for NATS connection
+-	ResolvConf      string   `json:"resolv_conf,omitempty" yaml:"resolv_conf,omitempty"` // Optional resolv.conf path to derive DNS servers for NATS connection
+ }
+ 
+ // Validate validates the connection configuration
+diff --git a/types/dns.go b/types/dns.go
+index fd37136..c80ec20 100644
+--- a/types/dns.go
++++ b/types/dns.go
+@@ -11,23 +11,17 @@ type DNSConfig struct {
+ 	// Servers overrides DNS resolution to use the provided servers.
+ 	// Example: ["8.8.8.8", "1.1.1.1"]
+ 	Servers []string `json:"servers,omitempty" yaml:"servers,omitempty"`
+-
+-	// ResolvConf points to a resolv.conf file to derive DNS servers.
+-	ResolvConf string `json:"resolv_conf,omitempty" yaml:"resolv_conf,omitempty"`
+ }
+ 
+ // IsEmpty returns true if no DNS override is configured.
+ func (c DNSConfig) IsEmpty() bool {
+-	return len(c.Servers) == 0 && strings.TrimSpace(c.ResolvConf) == ""
++	return len(c.Servers) == 0
+ }
+ 
+ // Equals returns true if both configs resolve to the same normalized settings.
+ func (c DNSConfig) Equals(other DNSConfig) bool {
+ 	a := c.normalized()
+ 	b := other.normalized()
+-	if a.ResolvConf != b.ResolvConf {
+-		return false
+-	}
+ 	if len(a.Servers) != len(b.Servers) {
+ 		return false
+ 	}
+@@ -43,8 +37,7 @@ func (c DNSConfig) normalized() DNSConfig {
+ 	servers := normalizeDNSServerList(c.Servers)
+ 	sort.Strings(servers)
+ 	return DNSConfig{
+-		Servers:    servers,
+-		ResolvConf: strings.TrimSpace(c.ResolvConf),
++		Servers: servers,
+ 	}
+ }
+ 
+diff --git a/types/telemetry.go b/types/telemetry.go
+index fcde427..b8aaa64 100644
+--- a/types/telemetry.go
++++ b/types/telemetry.go
+@@ -60,13 +60,10 @@ type TelemetryConfig struct {
+ 	// Example: ["db.", "ncl."] to drop all db.* and ncl.* metrics
+ 	DropMetricPrefixes []string `json:"drop_metric_prefixes,omitempty" yaml:"drop_metric_prefixes,omitempty" `
+ 
+-	// Deprecated: use top-level dns.servers/resolv_conf instead.
++	// Deprecated: use top-level dns.servers instead.
+ 	// Example: ["8.8.8.8", "1.1.1.1"]
+ 	DNSServers []string `json:"dns_servers,omitempty" yaml:"dns_servers,omitempty" `
+ 
+-	// Deprecated: use top-level dns.servers/resolv_conf instead.
+-	ResolvConf string `json:"resolv_conf,omitempty" yaml:"resolv_conf,omitempty" `
+-
+ 	// Optional authentication configuration for telemetry exporters
+ 	Authentication *TelemetryAuthenticationConfig `json:"authentication,omitempty" yaml:"authentication,omitempty" `
+ }
+-- 
+2.52.0
+
